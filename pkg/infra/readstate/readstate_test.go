@@ -2,6 +2,7 @@ package readstate_test
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -148,6 +149,39 @@ func TestReconcileSkipsPruningWhenTruncated(t *testing.T) {
 	gt.True(t, ok)
 	_, ok = store.Lookup("stale")
 	gt.False(t, ok)
+}
+
+// The list is drawn from the terminal loop while polling and archiving mutate
+// the records from their own goroutines. An unguarded map would be a fatal
+// runtime error there, so this pins the guarantee under -race.
+func TestStoreIsSafeForConcurrentUse(t *testing.T) {
+	store := newStore(t)
+	gt.NoError(t, store.Load())
+
+	const workers = 8
+	var wg sync.WaitGroup
+
+	for w := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id := types.ThreadID("thread-" + string(rune('a'+w)))
+			for range 50 {
+				_ = store.Put(map[types.ThreadID]model.ReadOverride{
+					id: override(model.ReadStateRead, base, base),
+				})
+				_, _ = store.Lookup(id)
+				_, _ = store.Reconcile(
+					[]model.Notification{notification(id, base)},
+					readstate.ReconcileOption{PruneMissing: true, TTL: time.Hour, Now: base},
+				)
+				_ = store.Remove(id)
+				_ = store.Len()
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 func TestReconcileWithoutChangesDoesNotWrite(t *testing.T) {

@@ -27,15 +27,13 @@ func NewFile(path string) Store {
 	return &fileStore{path: path}
 }
 
-func (s *fileStore) Backend() Backend { return BackendFile }
-
-func (s *fileStore) Load(ctx context.Context) (*model.Credential, error) {
+func (s *fileStore) Load(ctx context.Context) (*model.Credential, Backend, error) {
 	info, err := os.Stat(s.path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil, goerr.Wrap(ErrNotFound, "credential file does not exist", goerr.V("path", s.path))
+			return nil, "", goerr.Wrap(ErrNotFound, "credential file does not exist", goerr.V("path", s.path))
 		}
-		return nil, goerr.Wrap(err, "failed to stat credential file", goerr.V("path", s.path))
+		return nil, "", goerr.Wrap(err, "failed to stat credential file", goerr.V("path", s.path))
 	}
 
 	// Refuse to read a token that other users on the machine can also read.
@@ -45,7 +43,7 @@ func (s *fileStore) Load(ctx context.Context) (*model.Credential, error) {
 	// only toggles the read-only attribute. Checking there would reject every
 	// credential file octify itself wrote.
 	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm&0o077 != 0 {
-		return nil, model.WithUserMessage(
+		return nil, "", model.WithUserMessage(
 			goerr.Wrap(ErrInsecurePermission, "credential file is group or world accessible",
 				goerr.V("path", s.path), goerr.V("mode", perm.String())),
 			model.UserMessage{
@@ -57,12 +55,12 @@ func (s *fileStore) Load(ctx context.Context) (*model.Credential, error) {
 
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
-		return nil, goerr.Wrap(err, "failed to read credential file", goerr.V("path", s.path))
+		return nil, "", goerr.Wrap(err, "failed to read credential file", goerr.V("path", s.path))
 	}
 
 	var cred model.Credential
 	if err := json.Unmarshal(raw, &cred); err != nil {
-		return nil, model.WithUserMessage(
+		return nil, "", model.WithUserMessage(
 			goerr.Wrap(model.ErrInvalidCredential, "credential file is not valid json",
 				goerr.V("path", s.path), goerr.V("cause", err.Error())),
 			model.UserMessage{
@@ -72,12 +70,12 @@ func (s *fileStore) Load(ctx context.Context) (*model.Credential, error) {
 		)
 	}
 	if err := cred.Validate(); err != nil {
-		return nil, decorateCredentialError(err, model.UserMessage{
+		return nil, "", decorateCredentialError(err, model.UserMessage{
 			Summary: "the credential file was written by a newer octify",
 			Action:  "update octify, or delete " + s.path,
 		})
 	}
-	return &cred, nil
+	return &cred, BackendFile, nil
 }
 
 func (s *fileStore) Save(ctx context.Context, cred *model.Credential) (Backend, error) {
