@@ -27,25 +27,33 @@ you archive it, and when it has been gone from the list for 30 days.
 Archiving is the one operation that does reach GitHub: it marks the thread
 **Done**, which removes it from the inbox on both sides.
 
-## Setup
-
-octify signs in with the OAuth device flow, which needs a client ID.
-
-1. Register an OAuth app at <https://github.com/settings/developers>.
-2. In the app settings, **enable device flow**. Without it GitHub answers every
-   sign-in with `device_flow_disabled`.
-3. Build with the client ID embedded, or pass it at runtime:
+## Install
 
 ```
-go build -ldflags "-X github.com/m-mizutani/octify/pkg/cli.DefaultClientID=<client id>" .
+go install github.com/m-mizutani/octify@latest
 ```
+
+Then run `octify` and press `o` to sign in. There is nothing to configure first:
+octify ships with its own OAuth app, and the client ID is compiled in.
+
+No client secret is involved — the device flow does not use one — and the client
+ID grants nothing by itself. Every token still comes from you approving the
+request on github.com.
+
+### Using your own OAuth app
+
+Only needed if you want octify to authenticate as an app you control, or if you
+are pointing it at GitHub Enterprise.
+
+1. Register an OAuth app at <https://github.com/settings/developers>. The
+   homepage and callback URLs are required by the form but unused here.
+2. Tick **Enable Device Flow**. Without it GitHub answers every sign-in with
+   `device_flow_disabled`.
+3. Pass the client ID:
 
 ```
 export OCTIFY_CLIENT_ID=<client id>
 ```
-
-No client secret is involved: the device flow does not use one, and the client
-ID is public information.
 
 ### Scopes
 
@@ -105,7 +113,7 @@ Every option is a flag with a matching environment variable. The flag wins.
 | Flag | Environment | Default | Meaning |
 | --- | --- | --- | --- |
 | `--interval` | `OCTIFY_INTERVAL` | `60s` | Lower bound for polling |
-| `--client-id` | `OCTIFY_CLIENT_ID` | build-time value | OAuth app client ID |
+| `--client-id` | `OCTIFY_CLIENT_ID` | compiled in | OAuth app client ID |
 | `--api-base` | `OCTIFY_API_BASE` | `https://api.github.com` | REST root |
 | `--web-base` | `OCTIFY_WEB_BASE` | `https://github.com` | Web root |
 | `--credential-file` | `OCTIFY_CREDENTIAL_FILE` | see below | Token file, when no keychain |

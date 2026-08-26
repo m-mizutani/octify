@@ -23,11 +23,18 @@ import (
 	ucli "github.com/urfave/cli/v3"
 )
 
-// Version and DefaultClientID are filled in at build time with -ldflags.
-// The client ID is public information: the device flow needs no client secret.
 var (
-	Version         = "dev"
-	DefaultClientID = ""
+	// Version is filled in at build time with -ldflags.
+	Version = "dev"
+
+	// DefaultClientID is octify's own OAuth app, so that a plain `go install`
+	// produces a binary that can sign in without any further setup.
+	//
+	// A client ID is public information: the device flow uses no client secret,
+	// and the ID alone grants nothing — every token still comes from a person
+	// approving the request on github.com. It can be overridden with
+	// --client-id or OCTIFY_CLIENT_ID to point octify at another app.
+	DefaultClientID = "Ov23liscIpYyCx1ELGuo"
 )
 
 // requiredScopes covers private repositories, which the notifications scope

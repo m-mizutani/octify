@@ -223,6 +223,13 @@ func TestFlagOverridesEnvironment(t *testing.T) {
 	gt.NoError(t, err)
 }
 
+// A blank default would mean `go install` produces a binary that cannot sign
+// in — the failure the compiled-in ID exists to prevent.
+func TestDefaultClientIDIsCompiledIn(t *testing.T) {
+	gt.S(t, cli.DefaultClientID).IsNotEmpty()
+	gt.S(t, cli.DefaultClientID).HasPrefix("Ov23li")
+}
+
 func TestMissingClientID(t *testing.T) {
 	e := newEnv(t, githubHandler(t, nil))
 
