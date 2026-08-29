@@ -26,12 +26,11 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "credential.json")
 	store := tokenstore.NewFile(path)
 
-	gt.Equal(t, store.Backend(), tokenstore.BackendFile)
-
 	backend := gt.R1(store.Save(t.Context(), sampleCredential())).NoError(t)
 	gt.Equal(t, backend, tokenstore.BackendFile)
 
-	loaded := gt.R1(store.Load(t.Context())).NoError(t)
+	loaded, backend, loadErr := store.Load(t.Context())
+	gt.NoError(t, loadErr)
 	want := sampleCredential()
 	gt.Equal(t, loaded.Version, want.Version)
 	gt.Equal(t, loaded.Host, want.Host)
@@ -47,14 +46,14 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	gt.Equal(t, dirInfo.Mode().Perm(), os.FileMode(0o700))
 
 	gt.NoError(t, store.Delete(t.Context()))
-	_, err := store.Load(t.Context())
+	_, _, err := store.Load(t.Context())
 	gt.Error(t, err).Is(tokenstore.ErrNotFound)
 }
 
 func TestFileStoreMissingFile(t *testing.T) {
 	store := tokenstore.NewFile(filepath.Join(t.TempDir(), "absent.json"))
 
-	_, err := store.Load(t.Context())
+	_, _, err := store.Load(t.Context())
 	gt.Error(t, err).Is(tokenstore.ErrNotFound)
 
 	gt.Error(t, store.Delete(t.Context())).Is(tokenstore.ErrNotFound)
@@ -67,7 +66,7 @@ func TestFileStoreRejectsLoosePermission(t *testing.T) {
 
 	gt.NoError(t, os.Chmod(path, 0o644))
 
-	cred, err := store.Load(t.Context())
+	cred, _, err := store.Load(t.Context())
 	gt.Error(t, err).Is(tokenstore.ErrInsecurePermission)
 	gt.Nil(t, cred)
 
@@ -102,7 +101,7 @@ func TestFileStoreBrokenContent(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "credential.json")
 			gt.NoError(t, os.WriteFile(path, []byte(tc.content), 0o600))
 
-			_, err := tokenstore.NewFile(path).Load(t.Context())
+			_, _, err := tokenstore.NewFile(path).Load(t.Context())
 			gt.Error(t, err).Is(tc.wantErr)
 
 			msg, ok := model.UserMessageOf(err)

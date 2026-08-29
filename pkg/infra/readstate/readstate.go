@@ -2,6 +2,7 @@ package readstate
 
 import (
 	"maps"
+	"sync"
 	"time"
 
 	"github.com/m-mizutani/goerr/v2"
@@ -21,9 +22,12 @@ var (
 // whenever something changes. The records are small enough that this stays
 // cheaper than maintaining an index.
 //
-// Methods are called from the Bubble Tea update loop and from the archive
-// goroutine's completion handler only, so there is no internal locking.
+// Every method is safe for concurrent use. The list is drawn from the terminal
+// loop while polling and archiving run in their own goroutines, and all three
+// reach these records; an unguarded map would be a fatal runtime error rather
+// than a recoverable one.
 type Store struct {
+	mu        sync.RWMutex
 	path      string
 	host      string
 	overrides map[types.ThreadID]model.ReadOverride
@@ -32,6 +36,8 @@ type Store struct {
 
 // New returns an empty store. Call Load before using it so that the records
 // from a previous run are visible.
+//
+// host is recorded in the file for diagnosis only; it does not affect behaviour.
 func New(path, host string) *Store {
 	return &Store{
 		path:      path,
@@ -42,10 +48,16 @@ func New(path, host string) *Store {
 
 func (s *Store) Path() string { return s.path }
 
-func (s *Store) Len() int { return len(s.overrides) }
+func (s *Store) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.overrides)
+}
 
 // Lookup returns the record for one notification, if any.
 func (s *Store) Lookup(id types.ThreadID) (model.ReadOverride, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	ov, ok := s.overrides[id]
 	return ov, ok
 }
@@ -55,6 +67,9 @@ func (s *Store) Put(entries map[types.ThreadID]model.ReadOverride) error {
 	if len(entries) == 0 {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	maps.Copy(s.overrides, entries)
 	return s.write()
 }
@@ -62,6 +77,9 @@ func (s *Store) Put(entries map[types.ThreadID]model.ReadOverride) error {
 // Remove drops records and writes the file only when something was actually
 // removed.
 func (s *Store) Remove(ids ...types.ThreadID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	removed := false
 	for _, id := range ids {
 		if _, ok := s.overrides[id]; ok {
@@ -87,6 +105,9 @@ type ReconcileOption struct {
 // Reconcile drops records that no longer mean anything: those overtaken by a
 // newer update, and those whose notification has been gone for longer than TTL.
 func (s *Store) Reconcile(notifications []model.Notification, opt ReconcileOption) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	alive := make(map[types.ThreadID]struct{}, len(notifications))
 	removed := 0
 

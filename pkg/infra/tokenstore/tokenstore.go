@@ -23,12 +23,15 @@ var (
 	ErrInsecurePermission = goerr.New("tokenstore: credential file permission is too open")
 )
 
+// Store persists the GitHub credential.
+//
+// Load and Save both report which backend actually served the call. A single
+// Backend() accessor could not answer truthfully once a fallback is involved,
+// because the answer depends on which backend happened to work at the time.
 type Store interface {
-	Load(ctx context.Context) (*model.Credential, error)
-	// Save reports which backend actually took the credential.
+	Load(ctx context.Context) (*model.Credential, Backend, error)
 	Save(ctx context.Context, cred *model.Credential) (Backend, error)
 	Delete(ctx context.Context) error
-	Backend() Backend
 }
 
 // fallbackStore prefers primary and drops to secondary only when the primary
@@ -44,19 +47,17 @@ func NewFallback(primary, secondary Store) Store {
 	return &fallbackStore{primary: primary, secondary: secondary}
 }
 
-func (s *fallbackStore) Backend() Backend { return s.primary.Backend() }
-
-func (s *fallbackStore) Load(ctx context.Context) (*model.Credential, error) {
-	cred, err := s.primary.Load(ctx)
+func (s *fallbackStore) Load(ctx context.Context) (*model.Credential, Backend, error) {
+	cred, backend, err := s.primary.Load(ctx)
 	if err == nil {
-		return cred, nil
+		return cred, backend, nil
 	}
 	// Both "this machine has no keychain" and "the keychain has nothing" mean the
 	// file is the next place to look.
 	if errors.Is(err, ErrBackendUnavailable) || errors.Is(err, ErrNotFound) {
 		return s.secondary.Load(ctx)
 	}
-	return nil, err
+	return nil, "", err
 }
 
 func (s *fallbackStore) Save(ctx context.Context, cred *model.Credential) (Backend, error) {

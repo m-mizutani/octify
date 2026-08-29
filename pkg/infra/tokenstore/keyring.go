@@ -24,17 +24,15 @@ func NewKeyring(service, user string) Store {
 	return &keyringStore{service: service, user: user}
 }
 
-func (s *keyringStore) Backend() Backend { return BackendKeyring }
-
-func (s *keyringStore) Load(ctx context.Context) (*model.Credential, error) {
+func (s *keyringStore) Load(ctx context.Context) (*model.Credential, Backend, error) {
 	raw, err := keyring.Get(s.service, s.user)
 	if err != nil {
-		return nil, s.translate(err, "failed to read from keyring")
+		return nil, "", s.translate(err, "failed to read from keyring")
 	}
 
 	var cred model.Credential
 	if err := json.Unmarshal([]byte(raw), &cred); err != nil {
-		return nil, model.WithUserMessage(
+		return nil, "", model.WithUserMessage(
 			goerr.Wrap(model.ErrInvalidCredential, "keyring entry is not valid json",
 				goerr.V("service", s.service), goerr.V("user", s.user)),
 			model.UserMessage{
@@ -46,12 +44,12 @@ func (s *keyringStore) Load(ctx context.Context) (*model.Credential, error) {
 	if err := cred.Validate(); err != nil {
 		// The advice has to name the keychain, not a file path: there is no file
 		// for the user to delete on this path.
-		return nil, decorateCredentialError(err, model.UserMessage{
+		return nil, "", decorateCredentialError(err, model.UserMessage{
 			Summary: "the credential in the OS keychain was written by a newer octify",
 			Action:  "update octify, or run: octify auth logout",
 		})
 	}
-	return &cred, nil
+	return &cred, BackendKeyring, nil
 }
 
 func (s *keyringStore) Save(ctx context.Context, cred *model.Credential) (Backend, error) {
