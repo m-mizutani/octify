@@ -61,6 +61,14 @@ func (u *UseCase) Archive(ctx context.Context, ids []types.ThreadID) <-chan Arch
 			}
 
 			err := client.MarkThreadDone(ctx, id)
+
+			// A request aborted because the user stopped the job is not a failure
+			// to report; reporting it would show "1 failed" for an action they
+			// deliberately cancelled.
+			if ctx.Err() != nil {
+				return
+			}
+
 			if errors.Is(err, gh.ErrNotFound) {
 				err = nil
 			}
