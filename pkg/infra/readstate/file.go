@@ -28,6 +28,9 @@ type stateFile struct {
 // Load reads the file into memory. A missing file is an empty set, not an error,
 // because that is the state of a first run.
 func (s *Store) Load() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -89,6 +92,8 @@ func (s *Store) Load() error {
 
 // write persists the whole map. Every mutation goes through here so that a
 // crash cannot lose an operation the user already saw applied.
+//
+// The caller must already hold s.mu for writing.
 func (s *Store) write() error {
 	body := stateFile{
 		Version:   StateVersion,
