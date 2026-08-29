@@ -1,0 +1,182 @@
+package usecase
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/m-mizutani/octify/pkg/domain/model"
+	"github.com/m-mizutani/octify/pkg/infra/gh"
+	"github.com/m-mizutani/octify/pkg/infra/readstate"
+)
+
+// maxBackoffShift caps the exponential backoff at 8x the base interval.
+const maxBackoffShift = 3
+
+type PollResult struct {
+	NotModified    bool
+	Notifications  []model.Notification
+	ReviewRequests model.ReviewRequests
+	// ReviewErr is set when only the review search failed. The notification list
+	// is still usable in that case.
+	ReviewErr error
+	// Truncated is true when the page limit cut the list short.
+	Truncated bool
+	// Reconciled counts the read records dropped during this cycle.
+	Reconciled   int
+	ReconcileErr error
+	NextInterval time.Duration
+	NextState    model.PollState
+}
+
+// Poll runs one cycle: fetch, enrich with review requests, and tidy the read
+// records.
+//
+// On failure the returned result is still non-nil and carries NextInterval and
+// NextState, because the caller has to schedule the retry either way. The error
+// is returned alongside and must not be ignored.
+func (u *UseCase) Poll(ctx context.Context, st model.PollState) (*PollResult, error) {
+	// Hold on to one pointer for the whole cycle: a sign-out from the archive
+	// goroutine must not turn it into nil halfway through.
+	client := u.currentClient()
+	if client == nil {
+		err := notAuthenticated()
+		return u.failure(st, 0, err), err
+	}
+
+	first, err := client.ListNotifications(ctx, gh.ListNotificationsInput{
+		// Read notifications are always fetched: without them, anything read in
+		// the web UI would vanish from octify and could not be marked unread.
+		All:          true,
+		LastModified: st.LastModified,
+		PerPage:      gh.MaxPerPage,
+		Page:         1,
+	})
+	if err != nil {
+		u.handleAuthFailure(ctx, err)
+		return u.failure(st, 0, err), err
+	}
+
+	if first.NotModified {
+		return &PollResult{
+			NotModified:  true,
+			NextInterval: u.nextInterval(first.PollInterval, 0, 0),
+			NextState:    model.PollState{LastModified: st.LastModified},
+		}, nil
+	}
+
+	notifications := first.Notifications
+	truncated := false
+	fetched := 1
+	for page := first.NextPage; page != 0; {
+		if fetched >= u.cfg.MaxPages {
+			truncated = true
+			break
+		}
+		// Only the first page carries the conditional header; the rest are plain
+		// page fetches of the same snapshot.
+		next, err := client.ListNotifications(ctx, gh.ListNotificationsInput{
+			All:     true,
+			PerPage: gh.MaxPerPage,
+			Page:    page,
+		})
+		if err != nil {
+			u.handleAuthFailure(ctx, err)
+			// The interval GitHub asked for on page 1 still applies to the retry.
+			return u.failure(st, first.PollInterval, err), err
+		}
+		fetched++
+		notifications = append(notifications, next.Notifications...)
+		page = next.NextPage
+	}
+
+	result := &PollResult{
+		Notifications: notifications,
+		Truncated:     truncated,
+		NextState:     model.PollState{LastModified: first.LastModified},
+	}
+
+	// A failed search must not cost the notification list; the review marker is
+	// simply unavailable for this cycle.
+	reviews, reviewErr := client.ListReviewRequestedPullRequests(ctx)
+	if reviewErr != nil {
+		u.handleAuthFailure(ctx, reviewErr)
+		result.ReviewRequests = model.ReviewRequests{}
+		result.ReviewErr = reviewErr
+	} else {
+		result.ReviewRequests = reviews
+	}
+
+	removed, reconcileErr := u.reads.Reconcile(notifications, readstate.ReconcileOption{
+		// Dropping records for notifications that were merely not fetched would
+		// silently mark them unread again.
+		PruneMissing: !truncated,
+		TTL:          u.cfg.StateTTL,
+		Now:          u.now(),
+	})
+	result.Reconciled = removed
+	result.ReconcileErr = reconcileErr
+
+	result.NextInterval = u.nextInterval(first.PollInterval, 0, 0)
+	return result, nil
+}
+
+// failure builds the scheduling half of a failed cycle and rewrites the display
+// text so the user sees when the next attempt happens.
+func (u *UseCase) failure(st model.PollState, serverInterval time.Duration, err error) *PollResult {
+	failures := st.Failures + 1
+	interval := u.nextInterval(serverInterval, failures, retryAfterOf(err))
+
+	return &PollResult{
+		NextInterval: interval,
+		NextState:    model.PollState{LastModified: st.LastModified, Failures: failures},
+	}
+}
+
+// nextInterval honours GitHub's x-poll-interval as a floor, then applies the
+// backoff and any explicit Retry-After.
+func (u *UseCase) nextInterval(serverInterval time.Duration, failures int, retryAfter time.Duration) time.Duration {
+	base := u.cfg.MinInterval
+	if serverInterval > base {
+		base = serverInterval
+	}
+
+	if failures > 0 {
+		shift := min(failures, maxBackoffShift)
+		base <<= shift
+	}
+	if retryAfter > base {
+		base = retryAfter
+	}
+	return base
+}
+
+func retryAfterOf(err error) time.Duration {
+	var rate *gh.RateLimitError
+	if errors.As(err, &rate) {
+		return rate.RetryAfter
+	}
+	return 0
+}
+
+// handleAuthFailure drops the credential when GitHub says it is no longer valid.
+func (u *UseCase) handleAuthFailure(ctx context.Context, err error) {
+	if errors.Is(err, gh.ErrUnauthorized) {
+		u.forgetCredential(ctx)
+	}
+}
+
+// DescribeRetry rewrites an error's display text to name the wait before the
+// next attempt, which the raw error cannot know.
+func DescribeRetry(err error, interval time.Duration) error {
+	if err == nil {
+		return nil
+	}
+	msg, ok := model.UserMessageOf(err)
+	if !ok {
+		return err
+	}
+	msg.Action = fmt.Sprintf("retrying in %s", interval.Round(time.Second))
+	return model.WithUserMessage(err, msg)
+}

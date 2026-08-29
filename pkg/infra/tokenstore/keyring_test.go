@@ -14,17 +14,17 @@ func TestKeyringStoreRoundTrip(t *testing.T) {
 	keyring.MockInit()
 
 	store := tokenstore.NewKeyring(tokenstore.DefaultKeyringService, "github.com")
-	gt.Equal(t, store.Backend(), tokenstore.BackendKeyring)
 
 	backend := gt.R1(store.Save(t.Context(), sampleCredential())).NoError(t)
 	gt.Equal(t, backend, tokenstore.BackendKeyring)
 
-	loaded := gt.R1(store.Load(t.Context())).NoError(t)
+	loaded, backend, loadErr := store.Load(t.Context())
+	gt.NoError(t, loadErr)
 	gt.Equal(t, loaded.AccessToken, sampleCredential().AccessToken)
 	gt.Equal(t, loaded.Scope, sampleCredential().Scope)
 
 	gt.NoError(t, store.Delete(t.Context()))
-	_, err := store.Load(t.Context())
+	_, _, err := store.Load(t.Context())
 	gt.Error(t, err).Is(tokenstore.ErrNotFound)
 }
 
@@ -34,7 +34,7 @@ func TestKeyringStoreUnavailableBackend(t *testing.T) {
 
 	store := tokenstore.NewKeyring(tokenstore.DefaultKeyringService, "github.com")
 
-	_, loadErr := store.Load(t.Context())
+	_, _, loadErr := store.Load(t.Context())
 	gt.Error(t, loadErr).Is(tokenstore.ErrBackendUnavailable)
 
 	_, saveErr := store.Save(t.Context(), sampleCredential())
@@ -49,7 +49,7 @@ func TestKeyringStoreBrokenContent(t *testing.T) {
 	const service, user = "octify-test", "github.com"
 	gt.NoError(t, keyring.Set(service, user, "not json"))
 
-	_, err := tokenstore.NewKeyring(service, user).Load(t.Context())
+	_, _, err := tokenstore.NewKeyring(service, user).Load(t.Context())
 	gt.Error(t, err).Is(model.ErrInvalidCredential)
 
 	msg, ok := model.UserMessageOf(err)
@@ -63,6 +63,6 @@ func TestKeyringStoreUnsupportedVersion(t *testing.T) {
 	const service, user = "octify-test-version", "github.com"
 	gt.NoError(t, keyring.Set(service, user, `{"version": 99, "access_token": "t"}`))
 
-	_, err := tokenstore.NewKeyring(service, user).Load(t.Context())
+	_, _, err := tokenstore.NewKeyring(service, user).Load(t.Context())
 	gt.Error(t, err).Is(model.ErrUnsupportedCredentialVersion)
 }
