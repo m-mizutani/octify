@@ -39,7 +39,13 @@ func newClient(t *testing.T, handler http.HandlerFunc) *gh.Client {
 	t.Helper()
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
-	return gh.New("test-token", gh.WithAPIBase(srv.URL), gh.WithHTTPClient(srv.Client()))
+	// The GraphQL endpoint sits on its own path so a handler can tell the two
+	// apart, which is how GitHub Enterprise Server lays them out as well.
+	return gh.New("test-token",
+		gh.WithAPIBase(srv.URL),
+		gh.WithGraphQLBase(srv.URL+"/graphql"),
+		gh.WithHTTPClient(srv.Client()),
+	)
 }
 
 func TestListNotificationsSuccess(t *testing.T) {

@@ -120,28 +120,44 @@ func splitSubjectPath(rawURL string) (owner, repo, kind, id string, ok bool) {
 	return parts[0], parts[1], parts[2], parts[3], true
 }
 
-// PullRequestRef identifies a pull request across the notification list and the
-// search result.
-type PullRequestRef struct {
+// SubjectRef identifies an issue or pull request across the notification list,
+// the review search and the state lookup.
+type SubjectRef struct {
 	Repo   types.RepoFullName
 	Number int
 }
 
+// SubjectRef reports the issue or pull request this notification points at.
+// Check suites, workflow runs, releases, discussions and commits carry no
+// number that GitHub can resolve back to a subject, so they have no reference.
+func (n Notification) SubjectRef() (SubjectRef, bool) {
+	switch n.Subject.Type {
+	case types.SubjectPullRequest, types.SubjectIssue:
+	default:
+		return SubjectRef{}, false
+	}
+	return n.subjectRef()
+}
+
 // PullRequestRef reports the pull request this notification points at.
-func (n Notification) PullRequestRef() (PullRequestRef, bool) {
+func (n Notification) PullRequestRef() (SubjectRef, bool) {
 	if n.Subject.Type != types.SubjectPullRequest {
-		return PullRequestRef{}, false
+		return SubjectRef{}, false
 	}
+	return n.subjectRef()
+}
+
+func (n Notification) subjectRef() (SubjectRef, bool) {
 	if n.Subject.Number <= 0 || n.Repo.FullName == "" {
-		return PullRequestRef{}, false
+		return SubjectRef{}, false
 	}
-	return PullRequestRef{Repo: n.Repo.FullName, Number: n.Subject.Number}, true
+	return SubjectRef{Repo: n.Repo.FullName, Number: n.Subject.Number}, true
 }
 
 // ReviewRequests is the set of pull requests currently awaiting the user's review.
-type ReviewRequests map[PullRequestRef]struct{}
+type ReviewRequests map[SubjectRef]struct{}
 
-func (r ReviewRequests) Has(ref PullRequestRef) bool {
+func (r ReviewRequests) Has(ref SubjectRef) bool {
 	if r == nil {
 		return false
 	}

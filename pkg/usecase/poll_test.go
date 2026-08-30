@@ -1,9 +1,11 @@
 package usecase_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,8 +28,51 @@ func notificationJSON(id string, updatedAt time.Time) string {
 	}`, id, updatedAt.Format(time.RFC3339))
 }
 
+// checkSuiteJSON renders a list entry that points at nothing GitHub can resolve
+// back to an issue or a pull request.
+func checkSuiteJSON(id string, updatedAt time.Time) string {
+	return fmt.Sprintf(`{
+	  "id": %q,
+	  "unread": true,
+	  "reason": "ci_activity",
+	  "updated_at": %q,
+	  "subject": {"title": "build", "url": null, "type": "CheckSuite"},
+	  "repository": {"full_name": "acme/tools", "html_url": "https://github.com/acme/tools"}
+	}`, id, updatedAt.Format(time.RFC3339))
+}
+
 func emptySearch(w http.ResponseWriter) {
 	_, _ = w.Write([]byte(`{"total_count":0,"incomplete_results":false,"items":[]}`))
+}
+
+// emptyStates answers the state lookup with every alias unresolved, which is
+// what a poll sees when nothing in the list can be reached.
+func emptyStates(w http.ResponseWriter) {
+	_, _ = w.Write([]byte(`{"data":{}}`))
+}
+
+// statesJSON answers the state lookup by resolving every alias the query asked
+// for as the same subject, which is enough for tests that only care that the
+// states reached the result.
+func statesJSON(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+
+	var body struct {
+		Query string `json:"query"`
+	}
+	gt.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+
+	data := map[string]any{}
+	for _, line := range strings.Split(body.Query, "\n") {
+		alias, _, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if !ok || !strings.HasPrefix(alias, "s") {
+			continue
+		}
+		data[alias] = map[string]any{"subject": map[string]any{
+			"__typename": "Issue", "state": "CLOSED", "viewerDidAuthor": true,
+		}}
+	}
+	gt.NoError(t, json.NewEncoder(w).Encode(map[string]any{"data": data}))
 }
 
 func TestPollSuccess(t *testing.T) {
@@ -41,6 +86,8 @@ func TestPollSuccess(t *testing.T) {
 		case "/search/issues":
 			_, _ = w.Write([]byte(`{"total_count":1,"incomplete_results":false,"items":[
 			  {"number":7,"repository_url":"https://api.github.com/repos/acme/tools","pull_request":{"url":"x"}}]}`))
+		case "/graphql":
+			statesJSON(t, w, r)
 		}
 	})
 	h.authenticate(t)
@@ -49,8 +96,13 @@ func TestPollSuccess(t *testing.T) {
 
 	gt.False(t, res.NotModified)
 	gt.A(t, res.Notifications).Length(1)
-	gt.True(t, res.ReviewRequests.Has(model.PullRequestRef{Repo: "acme/tools", Number: 7}))
+	gt.True(t, res.ReviewRequests.Has(model.SubjectRef{Repo: "acme/tools", Number: 7}))
 	gt.Nil(t, res.ReviewErr)
+
+	gt.Nil(t, res.StateErr)
+	state, ok := res.SubjectStates.Lookup(model.SubjectRef{Repo: "acme/tools", Number: 1})
+	gt.True(t, ok)
+	gt.Equal(t, state, model.SubjectState{Authored: true, Closed: true})
 	gt.False(t, res.Truncated)
 	gt.Equal(t, res.NextState.LastModified, "Mon, 25 Aug 2026 08:55:12 GMT")
 	gt.Equal(t, res.NextState.Failures, 0)
@@ -58,7 +110,7 @@ func TestPollSuccess(t *testing.T) {
 }
 
 func TestPollNotModifiedSkipsSearch(t *testing.T) {
-	searchCalls := 0
+	searchCalls, stateCalls := 0, 0
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/notifications":
@@ -67,6 +119,9 @@ func TestPollNotModifiedSkipsSearch(t *testing.T) {
 		case "/search/issues":
 			searchCalls++
 			emptySearch(w)
+		case "/graphql":
+			stateCalls++
+			emptyStates(w)
 		}
 	})
 	h.authenticate(t)
@@ -76,8 +131,75 @@ func TestPollNotModifiedSkipsSearch(t *testing.T) {
 	gt.True(t, res.NotModified)
 	gt.A(t, res.Notifications).Length(0)
 	gt.Equal(t, res.NextState.LastModified, "prev")
-	// A 304 costs nothing, so the search rate limit must not be spent either.
+	// A 304 costs nothing, so neither the search nor the state lookup must spend
+	// a request on it.
 	gt.Equal(t, searchCalls, 0)
+	gt.Equal(t, stateCalls, 0)
+}
+
+// A conditional request that keeps answering 304 never reaches the state
+// lookup, so a pull request merged without its thread being touched would keep
+// a stale marker forever. The streak eventually forces an unconditional cycle.
+func TestPollRefreshesAfterAStreakOfNotModified(t *testing.T) {
+	var conditional []bool
+	stateCalls := 0
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			asked := r.Header.Get("If-Modified-Since") != ""
+			conditional = append(conditional, asked)
+			if asked {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			w.Header().Set("Last-Modified", "Mon, 25 Aug 2026 08:55:12 GMT")
+			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "]"))
+		case "/search/issues":
+			emptySearch(w)
+		case "/graphql":
+			stateCalls++
+			statesJSON(t, w, r)
+		}
+	})
+	h.authenticate(t)
+
+	st := model.PollState{LastModified: "prev"}
+	for i := 0; i < 10; i++ {
+		res := gt.R1(h.uc.Poll(t.Context(), st)).NoError(t)
+		gt.True(t, res.NotModified)
+		gt.Equal(t, res.NextState.NotModifiedStreak, i+1)
+		st = res.NextState
+	}
+
+	// Ten cycles cost nothing at all.
+	gt.Equal(t, stateCalls, 0)
+
+	// The eleventh asks unconditionally and the markers come back.
+	res := gt.R1(h.uc.Poll(t.Context(), st)).NoError(t)
+	gt.False(t, res.NotModified)
+	gt.Equal(t, stateCalls, 1)
+	gt.Equal(t, len(res.SubjectStates), 1)
+
+	// A full answer starts the count over.
+	gt.Equal(t, res.NextState.NotModifiedStreak, 0)
+	gt.Equal(t, res.NextState.LastModified, "Mon, 25 Aug 2026 08:55:12 GMT")
+
+	gt.Equal(t, conditional, []bool{true, true, true, true, true, true, true, true, true, true, false})
+}
+
+// A failed cycle answered nothing, so it must not push the unconditional
+// refresh further away.
+func TestPollFailureKeepsTheNotModifiedStreak(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	h.authenticate(t)
+
+	res, err := h.uc.Poll(t.Context(), model.PollState{NotModifiedStreak: 7})
+	gt.Error(t, err)
+	gt.Equal(t, res.NextState.NotModifiedStreak, 7)
+	gt.Equal(t, res.NextState.Failures, 1)
 }
 
 func TestPollNextInterval(t *testing.T) {
@@ -102,6 +224,8 @@ func TestPollNextInterval(t *testing.T) {
 					_, _ = w.Write([]byte(`[]`))
 				case "/search/issues":
 					emptySearch(w)
+				case "/graphql":
+					emptyStates(w)
 				}
 			}, withConfig(func(c *usecase.Config) { c.MinInterval = tc.minInterval }))
 			h.authenticate(t)
@@ -147,6 +271,8 @@ func TestPollSuccessResetsFailures(t *testing.T) {
 			_, _ = w.Write([]byte(`[]`))
 		case "/search/issues":
 			emptySearch(w)
+		case "/graphql":
+			emptyStates(w)
 		}
 	})
 	h.authenticate(t)
@@ -178,6 +304,8 @@ func TestPollPageLimit(t *testing.T) {
 			_, _ = w.Write([]byte("[" + notificationJSON(strconv.Itoa(pages), fixedNow) + "]"))
 		case "/search/issues":
 			emptySearch(w)
+		case "/graphql":
+			emptyStates(w)
 		}
 	}, withConfig(func(c *usecase.Config) { c.MaxPages = 4 }))
 	h.authenticate(t)
@@ -196,6 +324,8 @@ func TestPollSearchFailureIsNotFatal(t *testing.T) {
 			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "]"))
 		case "/search/issues":
 			w.WriteHeader(http.StatusForbidden)
+		case "/graphql":
+			statesJSON(t, w, r)
 		}
 	})
 	h.authenticate(t)
@@ -206,6 +336,90 @@ func TestPollSearchFailureIsNotFatal(t *testing.T) {
 	gt.A(t, res.Notifications).Length(1)
 	gt.Equal(t, len(res.ReviewRequests), 0)
 	gt.Error(t, res.ReviewErr)
+
+	// A failed search must not take the state lookup down with it.
+	gt.Nil(t, res.StateErr)
+	gt.Equal(t, len(res.SubjectStates), 1)
+}
+
+func TestPollStateFailureIsNotFatal(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "]"))
+		case "/search/issues":
+			emptySearch(w)
+		case "/graphql":
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	h.authenticate(t)
+
+	res := gt.R1(h.uc.Poll(t.Context(), model.PollState{})).NoError(t)
+
+	// The list stays; only the markers are missing for this cycle.
+	gt.A(t, res.Notifications).Length(1)
+	gt.Equal(t, len(res.SubjectStates), 0)
+	gt.Error(t, res.StateErr)
+	gt.Nil(t, res.ReviewErr)
+}
+
+func TestPollDeduplicatesSubjectRefs(t *testing.T) {
+	var numbers []any
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			// Three threads: two on the same issue, one on a check suite that
+			// carries no resolvable subject.
+			_, _ = w.Write([]byte("[" +
+				notificationJSON("1", fixedNow) + "," +
+				notificationJSON("2", fixedNow) + "," +
+				checkSuiteJSON("3", fixedNow) + "]"))
+		case "/search/issues":
+			emptySearch(w)
+		case "/graphql":
+			var body struct {
+				Variables map[string]any `json:"variables"`
+			}
+			gt.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			for key, value := range body.Variables {
+				if strings.HasPrefix(key, "n") {
+					numbers = append(numbers, value)
+				}
+			}
+			emptyStates(w)
+		}
+	})
+	h.authenticate(t)
+
+	gt.R1(h.uc.Poll(t.Context(), model.PollState{})).NoError(t)
+
+	// One slot in the query: the duplicate is folded in and the check suite is
+	// left out entirely.
+	gt.Equal(t, numbers, []any{float64(1)})
+}
+
+func TestPollStateUnauthorizedForgetsTheCredential(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "]"))
+		case "/search/issues":
+			emptySearch(w)
+		case "/graphql":
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	})
+	h.authenticate(t)
+
+	res := gt.R1(h.uc.Poll(t.Context(), model.PollState{})).NoError(t)
+
+	gt.Error(t, res.StateErr).Is(gh.ErrUnauthorized)
+
+	// A rejected token is dropped so the next start goes through the device flow
+	// instead of failing again.
+	_, _, err := h.tokens.Load(t.Context())
+	gt.Error(t, err)
 }
 
 func TestPollReconcilesReadState(t *testing.T) {
@@ -215,6 +429,8 @@ func TestPollReconcilesReadState(t *testing.T) {
 			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow.Add(time.Hour)) + "]"))
 		case "/search/issues":
 			emptySearch(w)
+		case "/graphql":
+			emptyStates(w)
 		}
 	})
 	h.authenticate(t)
@@ -240,6 +456,8 @@ func TestPollTruncatedDoesNotPruneMissingRecords(t *testing.T) {
 			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "]"))
 		case "/search/issues":
 			emptySearch(w)
+		case "/graphql":
+			emptyStates(w)
 		}
 	}, withConfig(func(c *usecase.Config) { c.MaxPages = 1 }))
 	h.authenticate(t)

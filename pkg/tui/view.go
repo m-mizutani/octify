@@ -18,19 +18,81 @@ const (
 	// chrome is the tab row plus the status row.
 	chrome = 2
 
-	repoWidth   = 28
-	kindWidth   = 8
-	timeWidth   = 4
-	markerWidth = 3 // selection, unread, review request
+	repoWidth = 28
+	kindWidth = 8
+	timeWidth = 4
+	// markerWidth counts the author bar, selection, unread, review request and
+	// state columns.
+	markerWidth = 5
+	// separators is the single space between each of the eight columns. The
+	// author bar is glued to the row's left edge and takes none of them.
+	separators = 7
 )
 
+// authorBar marks a row the signed-in user opened. It is a shape rather than a
+// letter because it is scanned, not read: it has to register in peripheral
+// vision while the eye is on the titles.
+const authorBar = "▏"
+
+// Colours come from the terminal's own 4-bit palette rather than fixed values,
+// so the user's theme decides the hues and the list stays legible on a light
+// scheme and a dark one alike.
 var (
-	styleTabActive   = lipgloss.NewStyle().Bold(true).Underline(true)
+	styleTabActive   = lipgloss.NewStyle().Bold(true).Underline(true).Foreground(lipgloss.Cyan)
 	styleTabInactive = lipgloss.NewStyle().Faint(true)
-	styleUnread      = lipgloss.NewStyle().Bold(true)
-	styleCursor      = lipgloss.NewStyle().Reverse(true)
 	styleStatus      = lipgloss.NewStyle().Faint(true)
+	styleCount       = lipgloss.NewStyle().Foreground(lipgloss.Cyan)
+
+	stylePlain     = lipgloss.NewStyle()
+	styleAuthorBar = lipgloss.NewStyle().Foreground(lipgloss.Cyan)
+	styleSelected  = lipgloss.NewStyle().Bold(true)
+	styleUnread    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Blue)
+	styleRead      = lipgloss.NewStyle().Faint(true)
+	styleReview    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Yellow)
+	styleMerged    = lipgloss.NewStyle().Foreground(lipgloss.Magenta)
+	styleClosed    = lipgloss.NewStyle().Foreground(lipgloss.Red)
+	styleMeta      = lipgloss.NewStyle().Faint(true)
+	styleTitle     = lipgloss.NewStyle()
 )
+
+// rowContext is what applies to every column of one row.
+//
+// Composing it into each column's own style is what keeps the row intact.
+// Wrapping the finished line instead - which is what this file used to do -
+// emits the outer attribute once and then lets the first coloured column's
+// reset cancel it for everything after: ESC[7m x ESC[36m A ESC[m rest… leaves
+// "rest" unhighlighted. Composed, the same row reads ESC[1;7;2;34m and has no
+// inner reset at all.
+type rowContext struct {
+	cursor   bool
+	finished bool
+}
+
+func (r rowContext) apply(s lipgloss.Style) lipgloss.Style {
+	if r.cursor {
+		// Faint is dropped rather than combined. Reverse swaps foreground and
+		// background, so ESC[7;2m dims what is now the background and leaves the
+		// text sitting on a colour almost identical to itself - the row under
+		// the cursor becomes the one row that cannot be read. Reverse already
+		// says "you are here" on its own.
+		return s.UnsetFaint().Reverse(true)
+	}
+	if r.finished {
+		s = s.Faint(true)
+	}
+	return s
+}
+
+// cell renders one column, which the caller has already padded to its width.
+func (r rowContext) cell(text string, s lipgloss.Style) string {
+	return r.apply(s).Render(text)
+}
+
+// gap renders the single space between two columns. It carries the context too,
+// or the cursor highlight would break at every column boundary.
+func (r rowContext) gap() string {
+	return r.apply(stylePlain).Render(" ")
+}
 
 // listHeight is how many notification rows fit on screen.
 func (m Model) listHeight() int {
@@ -88,6 +150,14 @@ func (m Model) renderHelp() string {
 	for _, e := range m.keys.helpEntries() {
 		lines = append(lines, "  "+pad(e.keys, 12)+"  "+e.desc)
 	}
+
+	// The legend draws each symbol in the style the list uses, so the colour is
+	// part of the explanation rather than something to memorise separately.
+	lines = append(lines, "", "Markers", "")
+	for _, e := range markerLegend() {
+		lines = append(lines, "  "+pad(e.style.Render(e.symbol), 12)+"  "+e.desc)
+	}
+
 	lines = append(lines, "", styleStatus.Render("esc or ? to close"))
 	return strings.Join(lines, "\n")
 }
@@ -99,7 +169,7 @@ func (m Model) renderList() string {
 		lines = append(lines, m.renderRows(height)...)
 	}
 
-	lines = append(lines, styleStatus.Render(m.renderStatus()))
+	lines = append(lines, m.renderStatus())
 	return strings.Join(lines, "\n")
 }
 
@@ -163,79 +233,108 @@ func (m Model) emptyMessage() string {
 	}
 }
 
-// renderRow builds the whole row as plain text and applies at most one style to
-// the finished line. The markers are distinguished by the characters themselves
-// so that nothing has to be styled mid-line, where a later truncation could cut
-// an escape sequence in half.
+// renderRow builds one row column by column. Each column carries its own style
+// with the row's context composed in, which is what lets the markers be
+// coloured without the cursor highlight stopping at the first one.
 func (m Model) renderRow(n model.Notification, atCursor bool) string {
-	selection := " "
+	var (
+		st    model.SubjectState
+		known bool
+	)
+	if ref, ok := n.SubjectRef(); ok {
+		st, known = m.states.Lookup(ref)
+	}
+
+	ctx := rowContext{cursor: atCursor, finished: known && st.Finished()}
+
+	bar, barStyle := " ", stylePlain
+	if known && st.Authored {
+		bar, barStyle = authorBar, styleAuthorBar
+	}
+
+	selection, selectionStyle := " ", stylePlain
 	if _, ok := m.selected[n.ID]; ok {
-		selection = "x"
+		selection, selectionStyle = "x", styleSelected
 	}
 
-	unread := "○"
-	isUnread := m.uc.Unread(n)
-	if isUnread {
-		unread = "●"
+	unread, unreadStyle := "○", styleRead
+	if m.uc.Unread(n) {
+		unread, unreadStyle = "●", styleUnread
 	}
 
-	review := " "
+	review, reviewStyle := " ", stylePlain
 	if ref, ok := n.PullRequestRef(); ok && m.reviews.Has(ref) {
-		review = "R"
+		review, reviewStyle = "R", styleReview
+	}
+
+	state, stateStyle := " ", stylePlain
+	switch {
+	case known && st.Merged:
+		state, stateStyle = "M", styleMerged
+	case known && st.Closed:
+		state, stateStyle = "C", styleClosed
 	}
 
 	kind := subjectKind(n) + " " + subjectNumber(n)
 
 	// Everything except the title is fixed width, so the title absorbs the rest.
-	fixed := markerWidth + 1 + repoWidth + 1 + kindWidth + 1 + timeWidth + 3
+	fixed := markerWidth + repoWidth + kindWidth + timeWidth + separators
 	titleWidth := max(m.width-fixed, 8)
 
-	line := truncate(strings.Join([]string{
-		selection, unread, review,
-		pad(truncateLeft(string(n.Repo.FullName), repoWidth), repoWidth),
-		pad(kind, kindWidth),
-		pad(truncate(n.Subject.Title, titleWidth), titleWidth),
-		relativeTime(n.UpdatedAt, m.cfg.Now()),
-	}, " "), m.width)
-
-	switch {
-	case atCursor:
-		return styleCursor.Render(line)
-	case isUnread:
-		return styleUnread.Render(line)
-	default:
-		return line
+	cells := []string{
+		ctx.cell(bar, barStyle) + ctx.cell(selection, selectionStyle),
+		ctx.cell(unread, unreadStyle),
+		ctx.cell(review, reviewStyle),
+		ctx.cell(state, stateStyle),
+		ctx.cell(pad(truncateLeft(string(n.Repo.FullName), repoWidth), repoWidth), styleMeta),
+		ctx.cell(pad(kind, kindWidth), styleMeta),
+		ctx.cell(pad(truncate(n.Subject.Title, titleWidth), titleWidth), styleTitle),
+		// Padded, unlike before: a relative time is usually shorter than its
+		// budget, and the leftover columns would end the cursor highlight short
+		// of the right edge now that the row is styled column by column.
+		ctx.cell(pad(relativeTime(n.UpdatedAt, m.cfg.Now()), timeWidth), styleMeta),
 	}
+	return truncate(strings.Join(cells, ctx.gap()), m.width)
 }
 
+// renderStatus styles each part separately rather than wrapping the finished
+// line: the unread count carries a colour, and its reset would end the faint
+// treatment of everything after it.
 func (m Model) renderStatus() string {
 	parts := make([]string, 0, 5)
 
 	if n := len(m.selected); n > 0 {
-		parts = append(parts, strconv.Itoa(n)+" selected")
+		parts = append(parts, styleStatus.Render(strconv.Itoa(n)+" selected"))
 	}
-	parts = append(parts, strconv.Itoa(m.unreadCount())+" unread")
+
+	unread := strconv.Itoa(m.unreadCount()) + " unread"
+	if m.unreadCount() > 0 {
+		parts = append(parts, styleCount.Render(unread))
+	} else {
+		parts = append(parts, styleStatus.Render(unread))
+	}
+
 	if !m.showRead {
-		parts = append(parts, "unread only")
+		parts = append(parts, styleStatus.Render("unread only"))
 	}
 	if m.filtering {
-		parts = append(parts, "filter: "+m.filter+"▌")
+		parts = append(parts, styleStatus.Render("filter: "+m.filter+"▌"))
 	} else if m.filter != "" {
-		parts = append(parts, "filter: "+m.filter)
+		parts = append(parts, styleStatus.Render("filter: "+m.filter))
 	}
 	if !m.nextPollAt.IsZero() {
 		if d := m.nextPollAt.Sub(m.cfg.Now()); d > 0 {
-			parts = append(parts, "poll in "+shortDuration(d))
+			parts = append(parts, styleStatus.Render("poll in "+shortDuration(d)))
 		}
 	}
 
-	line := strings.Join(parts, " · ")
+	line := strings.Join(parts, styleStatus.Render(" · "))
 	if m.status.Summary != "" {
 		// The message gets whatever the counters left over; its action is the
 		// first thing to go when that is not enough.
 		remaining := m.width - ansi.StringWidth(line) - 3
 		if message := joinMessage(m.status, remaining); message != "" {
-			line += " · " + message
+			line += styleStatus.Render(" · " + message)
 		}
 	}
 	return truncate(line, m.width)

@@ -1,6 +1,7 @@
 package gh
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -18,6 +19,11 @@ const (
 	DefaultAPIBase = "https://api.github.com"
 	// DefaultWebBase is where the device flow endpoints and the web UI live.
 	DefaultWebBase = "https://github.com"
+	// DefaultGraphQLBase is the GraphQL endpoint for github.com. GitHub
+	// Enterprise Server serves it at https://HOST/api/graphql, which shares no
+	// prefix with its REST root at https://HOST/api/v3, so it cannot be derived
+	// from apiBase.
+	DefaultGraphQLBase = "https://api.github.com/graphql"
 
 	apiVersion       = "2022-11-28"
 	defaultUserAgent = "octify"
@@ -27,10 +33,11 @@ const (
 // directly on net/http because every call depends on request and response
 // headers (If-Modified-Since, Last-Modified, x-poll-interval, Retry-After).
 type Client struct {
-	token     types.AccessToken
-	hc        *http.Client
-	apiBase   string
-	userAgent string
+	token       types.AccessToken
+	hc          *http.Client
+	apiBase     string
+	graphqlBase string
+	userAgent   string
 }
 
 type Option func(*Client)
@@ -51,6 +58,16 @@ func WithAPIBase(rawURL string) Option {
 	}
 }
 
+// WithGraphQLBase sets the GraphQL endpoint. It is separate from WithAPIBase
+// because GitHub Enterprise Server puts the two on different paths.
+func WithGraphQLBase(rawURL string) Option {
+	return func(c *Client) {
+		if rawURL != "" {
+			c.graphqlBase = trimSlash(rawURL)
+		}
+	}
+}
+
 func WithUserAgent(ua string) Option {
 	return func(c *Client) {
 		if ua != "" {
@@ -61,10 +78,11 @@ func WithUserAgent(ua string) Option {
 
 func New(token types.AccessToken, opts ...Option) *Client {
 	c := &Client{
-		token:     token,
-		hc:        &http.Client{Timeout: 30 * time.Second},
-		apiBase:   DefaultAPIBase,
-		userAgent: defaultUserAgent,
+		token:       token,
+		hc:          &http.Client{Timeout: 30 * time.Second},
+		apiBase:     DefaultAPIBase,
+		graphqlBase: DefaultGraphQLBase,
+		userAgent:   defaultUserAgent,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -84,11 +102,30 @@ func (c *Client) newRequest(ctx context.Context, method, path string, query url.
 			goerr.V("method", method), goerr.V("url", full))
 	}
 
+	c.setCommonHeaders(req)
+	return req, nil
+}
+
+// newBodyRequest builds a request that carries a JSON body. The GraphQL
+// endpoint is the only caller: every REST call octify makes is a GET or a
+// bodyless DELETE.
+func (c *Client) newBodyRequest(ctx context.Context, method, rawURL string, body []byte) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, goerr.Wrap(err, "failed to build request",
+			goerr.V("method", method), goerr.V("url", rawURL))
+	}
+
+	c.setCommonHeaders(req)
+	req.Header.Set("Content-Type", "application/json")
+	return req, nil
+}
+
+func (c *Client) setCommonHeaders(req *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+string(c.token))
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", apiVersion)
 	req.Header.Set("User-Agent", c.userAgent)
-	return req, nil
 }
 
 // do sends the request and converts anything that is not a success or 304 into

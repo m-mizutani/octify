@@ -91,6 +91,7 @@ func newHarness(t *testing.T, handler http.HandlerFunc, opts ...harnessOption) *
 		ClientID:    "client-id",
 		Scopes:      []string{"repo", "notifications"},
 		APIBase:     srv.URL,
+		GraphQLBase: srv.URL + "/graphql",
 		WebBase:     srv.URL,
 		MinInterval: 60 * time.Second,
 		MaxPages:    10,

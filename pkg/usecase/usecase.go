@@ -19,7 +19,10 @@ type Config struct {
 	ClientID string
 	Scopes   []string
 	APIBase  string
-	WebBase  string
+	// GraphQLBase is the GraphQL endpoint. GitHub Enterprise Server serves it
+	// on a different path than the REST root, so it is configured separately.
+	GraphQLBase string
+	WebBase     string
 	// MinInterval is the floor for polling. The effective interval is the larger
 	// of this and the x-poll-interval GitHub returns.
 	MinInterval time.Duration

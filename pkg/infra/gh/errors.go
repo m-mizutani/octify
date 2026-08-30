@@ -16,6 +16,10 @@ var (
 	ErrNotFound         = goerr.New("github: resource not found")
 	ErrUnexpectedStatus = goerr.New("github: unexpected status")
 	ErrInvalidResponse  = goerr.New("github: invalid response body")
+	// ErrGraphQLRequestFailed covers a GraphQL response that answered nothing.
+	// GitHub reports an exhausted point budget or a rejected document as HTTP
+	// 200 with a top-level error, so the status code alone cannot catch it.
+	ErrGraphQLRequestFailed = goerr.New("github: graphql request failed")
 )
 
 // RateLimitError reports that GitHub asked the caller to slow down. RetryAfter

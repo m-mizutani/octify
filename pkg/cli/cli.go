@@ -49,6 +49,7 @@ type options struct {
 	interval       time.Duration
 	clientID       string
 	apiBase        string
+	graphqlBase    string
 	webBase        string
 	credentialFile string
 	noKeyring      bool
@@ -118,6 +119,13 @@ func (o *options) flags() []ucli.Flag {
 			Value:       gh.DefaultAPIBase,
 			Sources:     ucli.EnvVars("OCTIFY_API_BASE"),
 			Destination: &o.apiBase,
+		},
+		&ucli.StringFlag{
+			Name:        "graphql-base",
+			Usage:       "GitHub GraphQL endpoint; GitHub Enterprise Server serves it at https://HOST/api/graphql",
+			Value:       gh.DefaultGraphQLBase,
+			Sources:     ucli.EnvVars("OCTIFY_GRAPHQL_BASE"),
+			Destination: &o.graphqlBase,
 		},
 		&ucli.StringFlag{
 			Name:        "web-base",
@@ -195,6 +203,23 @@ func (o *options) flags() []ucli.Flag {
 }
 
 func (o *options) validate() error {
+	// Refuse the one combination that would send the token to the wrong host.
+	// The two endpoints are configured separately because GitHub Enterprise
+	// Server puts them on paths that share no prefix, but that also lets a user
+	// move --api-base to their own server and leave GraphQL on github.com. Every
+	// poll would then POST their enterprise token to api.github.com, and the 401
+	// that comes back is indistinguishable from an expired token, so octify
+	// would delete the perfectly good credential it just saved.
+	if o.apiBase != gh.DefaultAPIBase && o.graphqlBase == gh.DefaultGraphQLBase {
+		return model.WithUserMessage(
+			goerr.New("graphql base still points at github.com",
+				goerr.V("api_base", o.apiBase), goerr.V("graphql_base", o.graphqlBase)),
+			model.UserMessage{
+				Summary: "--api-base points at another GitHub, but --graphql-base still points at github.com",
+				Action:  "set --graphql-base as well; GitHub Enterprise Server serves it at https://HOST/api/graphql",
+			},
+		)
+	}
 	if o.interval < time.Second {
 		return model.WithUserMessage(
 			goerr.New("interval is too small", goerr.V("interval", o.interval.String())),
@@ -358,17 +383,25 @@ func (o *options) build(ctx context.Context, requireReadState bool) (context.Con
 			slog.Any("error", err), slog.String("path", statePath))
 	}
 
-	uc := usecase.New(tokens, reads, usecase.Config{
+	uc := usecase.New(tokens, reads, o.usecaseConfig())
+	return ctx, uc, closer, nil
+}
+
+// usecaseConfig is where every flag turns into the configuration the deeper
+// layers see. It is separate from build so that a test can check the mapping
+// without standing up a token store and a state file.
+func (o *options) usecaseConfig() usecase.Config {
+	return usecase.Config{
 		ClientID:    o.clientID,
 		Scopes:      requiredScopes,
 		APIBase:     o.apiBase,
+		GraphQLBase: o.graphqlBase,
 		WebBase:     o.webBase,
 		MinInterval: o.interval,
 		MaxPages:    o.maxPages,
 		ArchiveGap:  o.archiveGap,
 		StateTTL:    o.stateTTL,
-	})
-	return ctx, uc, closer, nil
+	}
 }
 
 func runTUI(ctx context.Context, opt *options) error {

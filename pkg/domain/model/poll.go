@@ -6,4 +6,8 @@ type PollState struct {
 	LastModified string
 	// Failures counts consecutive failures and drives the backoff.
 	Failures int
+	// NotModifiedStreak counts how many cycles in a row GitHub answered with
+	// 304. A conditional request that keeps succeeding never reaches the state
+	// lookup, so the streak is what eventually forces an unconditional one.
+	NotModifiedStreak int
 }

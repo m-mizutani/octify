@@ -14,6 +14,17 @@ import (
 // maxBackoffShift caps the exponential backoff at 8x the base interval.
 const maxBackoffShift = 3
 
+// refreshAfterNotModified is how many consecutive 304 answers may pass before a
+// cycle asks unconditionally.
+//
+// The markers come from the subjects, not from the notification threads, so a
+// pull request can be merged without its thread being touched — GitHub does not
+// notify you of your own actions. The conditional request would then keep
+// answering 304 and the row would keep its stale marker. Ten cycles is at most
+// ten minutes at the default interval, and the unconditional cycle costs the
+// same as any ordinary one.
+const refreshAfterNotModified = 10
+
 type PollResult struct {
 	NotModified    bool
 	Notifications  []model.Notification
@@ -21,6 +32,12 @@ type PollResult struct {
 	// ReviewErr is set when only the review search failed. The notification list
 	// is still usable in that case.
 	ReviewErr error
+	// SubjectStates is what GitHub says about the issues and pull requests in
+	// Notifications. It is empty when the lookup failed.
+	SubjectStates model.SubjectStates
+	// StateErr is set when only the state lookup failed. The notification list
+	// is still usable in that case.
+	StateErr error
 	// Truncated is true when the page limit cut the list short.
 	Truncated bool
 	// Reconciled counts the read records dropped during this cycle.
@@ -45,11 +62,19 @@ func (u *UseCase) Poll(ctx context.Context, st model.PollState) (*PollResult, er
 		return u.failure(st, 0, err), err
 	}
 
+	// Dropping the conditional header is what makes the cycle unconditional: the
+	// list comes back in full and everything downstream, the state lookup
+	// included, runs as it would on any changed cycle.
+	lastModified := st.LastModified
+	if st.NotModifiedStreak >= refreshAfterNotModified {
+		lastModified = ""
+	}
+
 	first, err := client.ListNotifications(ctx, gh.ListNotificationsInput{
 		// Read notifications are always fetched: without them, anything read in
 		// the web UI would vanish from octify and could not be marked unread.
 		All:          true,
-		LastModified: st.LastModified,
+		LastModified: lastModified,
 		PerPage:      gh.MaxPerPage,
 		Page:         1,
 	})
@@ -62,7 +87,10 @@ func (u *UseCase) Poll(ctx context.Context, st model.PollState) (*PollResult, er
 		return &PollResult{
 			NotModified:  true,
 			NextInterval: u.nextInterval(first.PollInterval, 0, 0),
-			NextState:    model.PollState{LastModified: st.LastModified},
+			NextState: model.PollState{
+				LastModified:      st.LastModified,
+				NotModifiedStreak: st.NotModifiedStreak + 1,
+			},
 		}, nil
 	}
 
@@ -108,6 +136,17 @@ func (u *UseCase) Poll(ctx context.Context, st model.PollState) (*PollResult, er
 		result.ReviewRequests = reviews
 	}
 
+	// The state lookup is treated like the search above: losing the markers for
+	// one cycle is cheaper than losing the list.
+	states, stateErr := client.ListSubjectStates(ctx, subjectRefs(notifications))
+	if stateErr != nil {
+		u.handleAuthFailure(ctx, stateErr)
+		result.SubjectStates = model.SubjectStates{}
+		result.StateErr = stateErr
+	} else {
+		result.SubjectStates = states
+	}
+
 	removed, reconcileErr := u.reads.Reconcile(notifications, readstate.ReconcileOption{
 		// Dropping records for notifications that were merely not fetched would
 		// silently mark them unread again.
@@ -122,6 +161,28 @@ func (u *UseCase) Poll(ctx context.Context, st model.PollState) (*PollResult, er
 	return result, nil
 }
 
+// subjectRefs collects the issues and pull requests the list points at, in the
+// order they appear and without repeats. One subject can carry several
+// notification threads, and each of them would otherwise cost a slot in the
+// batched query.
+func subjectRefs(notifications []model.Notification) []model.SubjectRef {
+	seen := make(map[model.SubjectRef]struct{}, len(notifications))
+	out := make([]model.SubjectRef, 0, len(notifications))
+
+	for _, n := range notifications {
+		ref, ok := n.SubjectRef()
+		if !ok {
+			continue
+		}
+		if _, dup := seen[ref]; dup {
+			continue
+		}
+		seen[ref] = struct{}{}
+		out = append(out, ref)
+	}
+	return out
+}
+
 // failure builds the scheduling half of a failed cycle and rewrites the display
 // text so the user sees when the next attempt happens.
 func (u *UseCase) failure(st model.PollState, serverInterval time.Duration, err error) *PollResult {
@@ -130,7 +191,13 @@ func (u *UseCase) failure(st model.PollState, serverInterval time.Duration, err 
 
 	return &PollResult{
 		NextInterval: interval,
-		NextState:    model.PollState{LastModified: st.LastModified, Failures: failures},
+		NextState: model.PollState{
+			LastModified: st.LastModified,
+			Failures:     failures,
+			// Carried, not reset: a failed cycle answered nothing, so it must not
+			// push the unconditional refresh further away.
+			NotModifiedStreak: st.NotModifiedStreak,
+		},
 	}
 }
 
