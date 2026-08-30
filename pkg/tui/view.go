@@ -69,11 +69,16 @@ type rowContext struct {
 }
 
 func (r rowContext) apply(s lipgloss.Style) lipgloss.Style {
+	if r.cursor {
+		// Faint is dropped rather than combined. Reverse swaps foreground and
+		// background, so ESC[7;2m dims what is now the background and leaves the
+		// text sitting on a colour almost identical to itself - the row under
+		// the cursor becomes the one row that cannot be read. Reverse already
+		// says "you are here" on its own.
+		return s.UnsetFaint().Reverse(true)
+	}
 	if r.finished {
 		s = s.Faint(true)
-	}
-	if r.cursor {
-		s = s.Reverse(true)
 	}
 	return s
 }

@@ -237,6 +237,12 @@ func TestRenderRowContextReachesEveryColumn(t *testing.T) {
 		gt.True(t, len(runs) >= markerColumns)
 		for _, run := range runs {
 			gt.True(t, hasParam(run, sgrReverse))
+
+			// Never ESC[7;2m. Reverse swaps foreground and background, so faint
+			// would dim what is now the background and leave the text sitting on
+			// a colour almost identical to itself. This row is merged, so every
+			// column would carry faint if the two were simply combined.
+			gt.False(t, hasParam(run, sgrFaint))
 		}
 	})
 
