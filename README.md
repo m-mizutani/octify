@@ -129,8 +129,9 @@ one cause and drops `author` as soon as you are also mentioned.
 
 Rows whose subject GitHub cannot resolve — check suites, workflow runs,
 releases, discussions and commits — carry no author bar and no state marker.
-The same is true for one polling cycle when the state lookup fails; the list
-itself is never lost over it.
+The same is true for one polling cycle when the lookup fails, which the status
+line reports as `marker status unavailable`; the list itself is never lost
+over it.
 
 Press `?` for the same legend inside octify.
 

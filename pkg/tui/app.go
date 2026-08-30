@@ -578,6 +578,10 @@ func pollStatus(res *usecase.PollResult) model.UserMessage {
 		return messageOf(res.ReconcileErr)
 	case res.ReviewErr != nil:
 		return model.UserMessage{Summary: "review status unavailable"}
+	case res.StateErr != nil:
+		// Without this the author bar and the merged/closed markers just vanish
+		// from every row, which reads as "nothing here is finished".
+		return model.UserMessage{Summary: "marker status unavailable"}
 	case res.Truncated:
 		return model.UserMessage{Summary: "showing the first " + strconv.Itoa(len(res.Notifications)) + " notifications"}
 	default:

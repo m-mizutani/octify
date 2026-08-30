@@ -636,6 +636,10 @@ func TestPollStatusMessages(t *testing.T) {
 			res:  usecase.PollResult{ReviewErr: goerr.New("search failed")},
 			want: "review status unavailable",
 		},
+		"state lookup failed": {
+			res:  usecase.PollResult{StateErr: goerr.New("graphql failed")},
+			want: "marker status unavailable",
+		},
 		"truncated": {
 			res:  usecase.PollResult{Truncated: true},
 			want: "showing the first 0 notifications",
