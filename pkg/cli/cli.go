@@ -203,6 +203,23 @@ func (o *options) flags() []ucli.Flag {
 }
 
 func (o *options) validate() error {
+	// Refuse the one combination that would send the token to the wrong host.
+	// The two endpoints are configured separately because GitHub Enterprise
+	// Server puts them on paths that share no prefix, but that also lets a user
+	// move --api-base to their own server and leave GraphQL on github.com. Every
+	// poll would then POST their enterprise token to api.github.com, and the 401
+	// that comes back is indistinguishable from an expired token, so octify
+	// would delete the perfectly good credential it just saved.
+	if o.apiBase != gh.DefaultAPIBase && o.graphqlBase == gh.DefaultGraphQLBase {
+		return model.WithUserMessage(
+			goerr.New("graphql base still points at github.com",
+				goerr.V("api_base", o.apiBase), goerr.V("graphql_base", o.graphqlBase)),
+			model.UserMessage{
+				Summary: "--api-base points at another GitHub, but --graphql-base still points at github.com",
+				Action:  "set --graphql-base as well; GitHub Enterprise Server serves it at https://HOST/api/graphql",
+			},
+		)
+	}
 	if o.interval < time.Second {
 		return model.WithUserMessage(
 			goerr.New("interval is too small", goerr.V("interval", o.interval.String())),

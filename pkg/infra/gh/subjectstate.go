@@ -43,6 +43,9 @@ type graphQLResponse struct {
 type graphQLError struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
+	// Path names the field that failed. An error without one did not come from
+	// a single alias: it rejected the whole request.
+	Path []any `json:"path"`
 }
 
 // repositoryNode is one alias of the batched document. Both the node and the
@@ -77,6 +80,15 @@ func (c *Client) ListSubjectStates(ctx context.Context, refs []model.SubjectRef)
 		}
 	}
 
+	// --max-pages is only checked for being at least 1, so a large enough
+	// setting can put more subjects in the list than the cap will resolve. Say
+	// so, or the rows past the cap look like open pull requests nobody wrote.
+	if len(refs) > 0 {
+		logging.From(ctx).Warn("state lookup stopped at the query cap",
+			slog.Int("unresolved", len(refs)),
+			slog.Int("cap", maxSubjectQueries*maxSubjectsPerQuery))
+	}
+
 	return out, nil
 }
 
@@ -107,11 +119,16 @@ func (c *Client) collectSubjectStates(ctx context.Context, batch []model.Subject
 		return invalidResponse(err, "graphql")
 	}
 
-	// A subject in a repository the token cannot see comes back as one NOT_FOUND
-	// entry while every other alias resolves normally. Failing the batch would
-	// cost a hundred markers for one of them.
+	// GitHub answers an exhausted point budget or a rejected document with HTTP
+	// 200 and a top-level error, so c.do cannot catch it. Such an error carries
+	// no path, unlike the per-alias NOT_FOUND that a repository the token cannot
+	// see produces. Only the latter is safe to absorb: absorbing the former
+	// would report "nothing here is finished" for the whole rate limit window.
+	if err := requestLevelError(decoded.Errors); err != nil {
+		return err
+	}
 	if len(decoded.Errors) > 0 {
-		logging.From(ctx).Debug("graphql returned partial errors",
+		logging.From(ctx).Debug("graphql could not resolve some subjects",
 			slog.Int("count", len(decoded.Errors)),
 			slog.String("first", decoded.Errors[0].Message))
 	}
@@ -130,6 +147,22 @@ func (c *Client) collectSubjectStates(ctx context.Context, batch []model.Subject
 			continue
 		}
 		out[ref] = state
+	}
+	return nil
+}
+
+// requestLevelError reports the first error that rejected the request as a
+// whole rather than one alias within it.
+func requestLevelError(errs []graphQLError) error {
+	for _, e := range errs {
+		if len(e.Path) > 0 {
+			continue
+		}
+		return model.WithUserMessage(
+			goerr.Wrap(ErrGraphQLRequestFailed, "graphql rejected the request",
+				goerr.V("type", e.Type), goerr.V("message", e.Message)),
+			model.UserMessage{Summary: "GitHub could not answer the marker lookup"},
+		)
 	}
 	return nil
 }

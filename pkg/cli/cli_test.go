@@ -43,6 +43,7 @@ func (e *env) args(extra ...string) []string {
 		"octify",
 		"--client-id", "test-client",
 		"--api-base", e.serverURL,
+		"--graphql-base", e.serverURL + "/graphql",
 		"--web-base", e.serverURL,
 		"--no-keyring",
 	}
@@ -268,10 +269,35 @@ func TestMissingClientID(t *testing.T) {
 
 	stderr, err := run(t, []string{
 		"octify", "--client-id", "", "--api-base", e.serverURL,
+		"--graphql-base", e.serverURL + "/graphql",
 		"--web-base", e.serverURL, "--no-keyring", "auth", "login",
 	})
 	gt.Error(t, err)
 	gt.S(t, stderr).Contains("no OAuth client ID is configured")
+}
+
+// Leaving --graphql-base on github.com while --api-base points elsewhere would
+// POST the enterprise token to api.github.com every poll, and the 401 that came
+// back would make octify delete the credential it had just saved.
+func TestApiBaseWithoutGraphQLBaseIsRejected(t *testing.T) {
+	e := newEnv(t, githubHandler(t, nil))
+
+	stderr, err := run(t, []string{
+		"octify", "--client-id", "test-client",
+		"--api-base", "https://ghe.example.com/api/v3",
+		"--web-base", "https://ghe.example.com",
+		"--no-keyring", "auth", "status",
+	})
+	gt.Error(t, err)
+	gt.S(t, stderr).Contains("--graphql-base still points at github.com")
+
+	// Naming both endpoints is accepted.
+	_, err = run(t, e.args("auth", "status"))
+	gt.NoError(t, err)
+
+	// So is leaving both at their defaults.
+	_, err = run(t, []string{"octify", "--client-id", "test-client", "--no-keyring", "auth", "status"})
+	gt.NoError(t, err)
 }
 
 func TestLogFileCapturesDetailWithoutTheToken(t *testing.T) {

@@ -193,7 +193,7 @@ func TestListSubjectStatesSkipsUnresolvableEntries(t *testing.T) {
 
 	testCases := map[string]string{
 		"repository is null": `{"data":{"s0":null,"s1":` + resolved + `},
-		  "errors":[{"type":"NOT_FOUND","message":"Could not resolve to a Repository"}]}`,
+		  "errors":[{"type":"NOT_FOUND","message":"Could not resolve to a Repository","path":["s0"]}]}`,
 		"subject is null":        `{"data":{"s0":{"subject":null},"s1":` + resolved + `}}`,
 		"unknown typename":       `{"data":{"s0":{"subject":{"__typename":"Discussion","state":"OPEN"}},"s1":` + resolved + `}}`,
 		"alias missing entirely": `{"data":{"s1":` + resolved + `}}`,
@@ -218,6 +218,33 @@ func TestListSubjectStatesSkipsUnresolvableEntries(t *testing.T) {
 			gt.False(t, ok)
 			_, ok = states.Lookup(refs[1])
 			gt.True(t, ok)
+		})
+	}
+}
+
+// GitHub answers an exhausted point budget with HTTP 200 and a top-level error.
+// Absorbing it the way a per-alias NOT_FOUND is absorbed would report "nothing
+// here is finished" for the whole rate limit window.
+func TestListSubjectStatesFailsOnRequestLevelErrors(t *testing.T) {
+	testCases := map[string]string{
+		"rate limited": `{"data":null,
+		  "errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}`,
+		"query rejected": `{"errors":[{"message":"Parse error on \"}\""}]}`,
+		"error without a path alongside resolved aliases": `{
+		  "data":{"s0":{"subject":{"__typename":"PullRequest","state":"OPEN","merged":false,"viewerDidAuthor":false}}},
+		  "errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}`,
+	}
+
+	for name, body := range testCases {
+		t.Run(name, func(t *testing.T) {
+			client := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(body))
+			})
+
+			_, err := client.ListSubjectStates(t.Context(), []model.SubjectRef{
+				{Repo: "acme/tools", Number: 1},
+			})
+			gt.Error(t, err).Is(gh.ErrGraphQLRequestFailed)
 		})
 	}
 }
