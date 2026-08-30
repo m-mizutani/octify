@@ -222,6 +222,10 @@ func (m Model) renderRows(height int) []string {
 
 func (m Model) emptyMessage() string {
 	switch {
+	case m.phase == phaseLoading:
+		// Before the first poll answers, "no notifications" would be a claim
+		// octify cannot yet make.
+		return "Loading notifications…"
 	case m.filter != "":
 		return "No notification matches the filter. Press esc to clear it."
 	case len(m.all) == 0 && !m.showRead:
@@ -301,7 +305,19 @@ func (m Model) renderRow(n model.Notification, atCursor bool) string {
 // line: the unread count carries a colour, and its reset would end the faint
 // treatment of everything after it.
 func (m Model) renderStatus() string {
-	parts := make([]string, 0, 5)
+	parts := make([]string, 0, 7)
+
+	// Both of these go first: the line is cut from the right when the terminal
+	// is narrow, and what octify is doing right now must survive that cut.
+	switch {
+	case m.phase == phaseLoading:
+		parts = append(parts, styleCount.Render("loading…"))
+	case m.polling:
+		parts = append(parts, styleStatus.Render("updating…"))
+	}
+	if m.showingCache {
+		parts = append(parts, styleStatus.Render("saved list"))
+	}
 
 	if n := len(m.selected); n > 0 {
 		parts = append(parts, styleStatus.Render(strconv.Itoa(n)+" selected"))

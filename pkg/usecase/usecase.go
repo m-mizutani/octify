@@ -9,6 +9,7 @@ import (
 	"github.com/m-mizutani/goerr/v2"
 	"github.com/m-mizutani/octify/pkg/domain/model"
 	"github.com/m-mizutani/octify/pkg/infra/gh"
+	"github.com/m-mizutani/octify/pkg/infra/pollcache"
 	"github.com/m-mizutani/octify/pkg/infra/readstate"
 	"github.com/m-mizutani/octify/pkg/infra/tokenstore"
 )
@@ -53,7 +54,10 @@ func notAuthenticated() error {
 type UseCase struct {
 	tokens tokenstore.Store
 	reads  *readstate.Store
-	cfg    Config
+	// cache is nil when the user turned the saved list off, which is why every
+	// use of it is guarded rather than assumed.
+	cache *pollcache.Store
+	cfg   Config
 
 	hc    *http.Client
 	now   func() time.Time
@@ -61,6 +65,40 @@ type UseCase struct {
 
 	mu     sync.RWMutex
 	client *gh.Client
+	// pollSeq numbers polling cycles in the order they start; savedSeq is the
+	// newest cycle whose result reached the cache. A manual refresh can leave
+	// two cycles in flight, and without these the slower one would write its
+	// older list over the newer one that is already on screen.
+	pollSeq  uint64
+	savedSeq uint64
+}
+
+// beginPoll hands one cycle the client to use and the number that orders it
+// against the others. Taking the pointer here means a concurrent sign-out
+// cannot turn it into nil midway through the cycle.
+func (u *UseCase) beginPoll() (*gh.Client, uint64) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.pollSeq++
+	return u.client, u.pollSeq
+}
+
+// dropClientAndSnapshot discards the credential in memory and the saved list
+// together.
+//
+// They go in one critical section because saveSnapshot checks the client under
+// the same lock: without that, a cycle already past its own check could write
+// the list back after this deleted it, leaving one account's notification
+// titles on disk for whoever signs in next.
+func (u *UseCase) dropClientAndSnapshot() error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	u.client = nil
+	if u.cache == nil {
+		return nil
+	}
+	return u.cache.Delete()
 }
 
 // currentClient returns the client to use for one operation. Taking a copy of
@@ -92,6 +130,14 @@ func WithClock(now func() time.Time) Option {
 		if now != nil {
 			u.now = now
 		}
+	}
+}
+
+// WithPollCache enables the saved notification list. Without it octify keeps
+// nothing between runs, which is what --no-cache asks for.
+func WithPollCache(store *pollcache.Store) Option {
+	return func(u *UseCase) {
+		u.cache = store
 	}
 }
 

@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -501,4 +504,269 @@ func TestDescribeRetry(t *testing.T) {
 	gt.Nil(t, usecase.DescribeRetry(nil, time.Second))
 	plain := gh.ErrForbidden
 	gt.Equal(t, usecase.DescribeRetry(plain, time.Second), error(plain))
+}
+
+// --- the saved list ---
+
+func TestPollSavesSnapshot(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "," + notificationJSON("2", fixedNow) + "]"))
+		case "/search/issues":
+			_, _ = w.Write([]byte(`{"total_count":1,"incomplete_results":false,"items":[
+			  {"number":7,"repository_url":"https://api.github.com/repos/acme/tools","pull_request":{"url":"x"}}]}`))
+		case "/graphql":
+			statesJSON(t, w, r)
+		}
+	})
+	h.authenticate(t)
+
+	res := gt.R1(h.uc.Poll(t.Context(), model.PollState{})).NoError(t)
+	gt.Nil(t, res.CacheErr)
+
+	saved, ok := h.savedList(t)
+	gt.True(t, ok)
+	gt.True(t, saved.SavedAt.Equal(fixedNow))
+	gt.A(t, saved.Notifications).Length(2)
+	gt.Equal(t, saved.Notifications[0].ID, types.ThreadID("1"))
+	gt.Equal(t, saved.Notifications[1].ID, types.ThreadID("2"))
+	gt.True(t, saved.ReviewRequests.Has(model.SubjectRef{Repo: "acme/tools", Number: 7}))
+
+	state, found := saved.SubjectStates.Lookup(model.SubjectRef{Repo: "acme/tools", Number: 1})
+	gt.True(t, found)
+	gt.Equal(t, state, model.SubjectState{Authored: true, Closed: true})
+}
+
+func TestPollNotModifiedLeavesSnapshotAlone(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Poll-Interval", "60")
+		w.WriteHeader(http.StatusNotModified)
+	})
+	h.authenticate(t)
+
+	// A cycle that saved would replace this with the empty list a 304 carries.
+	gt.NoError(t, h.cache.Save(&model.PollSnapshot{
+		SavedAt:       fixedNow.Add(-time.Hour),
+		Notifications: []model.Notification{{ID: "99", UpdatedAt: fixedNow}},
+	}))
+
+	res := gt.R1(h.uc.Poll(t.Context(), model.PollState{LastModified: "Mon, 25 Aug 2026 08:55:12 GMT"})).NoError(t)
+	gt.True(t, res.NotModified)
+	gt.Nil(t, res.CacheErr)
+
+	saved, ok := h.savedList(t)
+	gt.True(t, ok)
+	gt.A(t, saved.Notifications).Length(1)
+	gt.Equal(t, saved.Notifications[0].ID, types.ThreadID("99"))
+}
+
+func TestPollFailureDoesNotSaveSnapshot(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	h.authenticate(t)
+
+	_, err := h.uc.Poll(t.Context(), model.PollState{})
+	gt.Error(t, err)
+
+	_, ok := h.savedList(t)
+	gt.False(t, ok)
+}
+
+func TestPollSavesWhatTheMarkerFailuresLeft(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "]"))
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	h.authenticate(t)
+
+	res := gt.R1(h.uc.Poll(t.Context(), model.PollState{})).NoError(t)
+	gt.Error(t, res.ReviewErr)
+	gt.Error(t, res.StateErr)
+	gt.Nil(t, res.CacheErr)
+
+	// The saved list matches the screen: markers that were not drawn are not
+	// restored either.
+	saved, ok := h.savedList(t)
+	gt.True(t, ok)
+	gt.A(t, saved.Notifications).Length(1)
+	gt.Equal(t, len(saved.ReviewRequests), 0)
+	gt.Equal(t, len(saved.SubjectStates), 0)
+}
+
+func TestPollTruncatedSavesWhatIsShown(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			w.Header().Set("Link", `<https://api.github.com/notifications?page=9>; rel="next"`)
+			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "]"))
+		case "/search/issues":
+			emptySearch(w)
+		case "/graphql":
+			emptyStates(w)
+		}
+	}, withConfig(func(c *usecase.Config) { c.MaxPages = 1 }))
+	h.authenticate(t)
+
+	res := gt.R1(h.uc.Poll(t.Context(), model.PollState{})).NoError(t)
+	gt.True(t, res.Truncated)
+
+	saved, ok := h.savedList(t)
+	gt.True(t, ok)
+	gt.A(t, saved.Notifications).Length(len(res.Notifications))
+}
+
+func TestPollReportsSnapshotSaveFailure(t *testing.T) {
+	// A regular file where the parent directory should be: creating the
+	// directory fails, so the save cannot even begin.
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	gt.NoError(t, os.WriteFile(blocker, []byte("not a directory"), 0o600))
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "]"))
+		case "/search/issues":
+			emptySearch(w)
+		case "/graphql":
+			emptyStates(w)
+		}
+	}, withPollCachePath(filepath.Join(blocker, "poll-cache.json")))
+	h.authenticate(t)
+
+	res := gt.R1(h.uc.Poll(t.Context(), model.PollState{})).NoError(t)
+
+	// The list is untouched by the failure; only the saving of it failed.
+	gt.Error(t, res.CacheErr)
+	gt.A(t, res.Notifications).Length(1)
+
+	msg, ok := model.UserMessageOf(res.CacheErr)
+	gt.True(t, ok)
+	gt.S(t, msg.Summary).Contains("could not save the notification list")
+}
+
+func TestPollWithoutSnapshotStore(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "]"))
+		case "/search/issues":
+			emptySearch(w)
+		case "/graphql":
+			emptyStates(w)
+		}
+	}, withoutPollCache())
+	h.authenticate(t)
+
+	res := gt.R1(h.uc.Poll(t.Context(), model.PollState{})).NoError(t)
+	gt.Nil(t, res.CacheErr)
+	gt.A(t, res.Notifications).Length(1)
+
+	snap := gt.R1(h.uc.Snapshot()).NoError(t)
+	gt.Nil(t, snap)
+}
+
+func TestSnapshotReturnsWhatTheLastCycleSaved(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "]"))
+		case "/search/issues":
+			emptySearch(w)
+		case "/graphql":
+			emptyStates(w)
+		}
+	})
+	h.authenticate(t)
+	gt.R1(h.uc.Poll(t.Context(), model.PollState{})).NoError(t)
+
+	snap := gt.R1(h.uc.Snapshot()).NoError(t)
+	gt.NotNil(t, snap)
+	gt.A(t, snap.Notifications).Length(1)
+	gt.Equal(t, snap.Notifications[0].ID, types.ThreadID("1"))
+}
+
+func TestSnapshotOnFirstRun(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+
+	// Nothing has been saved yet, which is not a failure.
+	snap := gt.R1(h.uc.Snapshot()).NoError(t)
+	gt.Nil(t, snap)
+}
+
+func TestMarkerLookupUnauthorizedDoesNotBringBackTheSavedList(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "]"))
+		default:
+			// The list came back, but GitHub rejects the token for everything
+			// else: the cycle carries on with empty markers while the credential
+			// is being dropped underneath it.
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	})
+	h.authenticate(t)
+	gt.NoError(t, h.cache.Save(&model.PollSnapshot{
+		SavedAt:       fixedNow,
+		Notifications: []model.Notification{{ID: "99", UpdatedAt: fixedNow}},
+	}))
+
+	res := gt.R1(h.uc.Poll(t.Context(), model.PollState{})).NoError(t)
+	gt.Error(t, res.ReviewErr).Is(gh.ErrUnauthorized)
+	gt.False(t, h.uc.Authenticated())
+
+	// Writing the list back here would leave one account's notification titles
+	// on disk for whoever signs in next.
+	_, ok := h.savedList(t)
+	gt.False(t, ok)
+}
+
+func TestSlowCycleDoesNotSaveOverANewerOne(t *testing.T) {
+	var (
+		started = make(chan struct{})
+		release = make(chan struct{})
+		calls   atomic.Int64
+	)
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			if calls.Add(1) == 1 {
+				close(started)
+				<-release
+				_, _ = w.Write([]byte("[" + notificationJSON("old", fixedNow) + "]"))
+				return
+			}
+			_, _ = w.Write([]byte("[" + notificationJSON("new", fixedNow) + "]"))
+		case "/search/issues":
+			emptySearch(w)
+		case "/graphql":
+			emptyStates(w)
+		}
+	})
+	h.authenticate(t)
+
+	// A manual refresh can leave two cycles in flight. The first one to start
+	// is the one that finishes last here.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		gt.R1(h.uc.Poll(t.Context(), model.PollState{})).NoError(t)
+	}()
+
+	<-started
+	gt.R1(h.uc.Poll(t.Context(), model.PollState{})).NoError(t)
+	close(release)
+	<-done
+
+	// The newer list is the one on screen, so it has to be the one on disk.
+	saved, ok := h.savedList(t)
+	gt.True(t, ok)
+	gt.A(t, saved.Notifications).Length(1)
+	gt.Equal(t, saved.Notifications[0].ID, types.ThreadID("new"))
 }

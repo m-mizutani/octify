@@ -2,12 +2,15 @@ package usecase_test
 
 import (
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/m-mizutani/goerr/v2"
 	"github.com/m-mizutani/gt"
 	"github.com/m-mizutani/octify/pkg/domain/model"
+	"github.com/m-mizutani/octify/pkg/domain/types"
 	"github.com/m-mizutani/octify/pkg/infra/gh"
 	"github.com/m-mizutani/octify/pkg/infra/tokenstore"
 )
@@ -126,4 +129,70 @@ func TestUnauthorizedPollDropsCredential(t *testing.T) {
 	// The next start has to go through the device flow rather than fail again.
 	gt.False(t, h.uc.Authenticated())
 	gt.Equal(t, h.tokens.deletes, 1)
+}
+
+func TestLogoutDeletesSavedList(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	h.authenticate(t)
+	gt.NoError(t, h.cache.Save(&model.PollSnapshot{
+		SavedAt:       fixedNow,
+		Notifications: []model.Notification{{ID: "1", UpdatedAt: fixedNow}},
+	}))
+	gt.NoError(t, h.reads.Put(map[types.ThreadID]model.ReadOverride{
+		"1": {State: model.ReadStateRead, At: fixedNow, SubjectUpdatedAt: fixedNow},
+	}))
+
+	gt.NoError(t, h.uc.Logout(t.Context()))
+
+	_, ok := h.savedList(t)
+	gt.False(t, ok)
+	// Read records are a separate concern and survive signing back in.
+	gt.Equal(t, h.reads.Len(), 1)
+}
+
+func TestLogoutReportsSavedListDeleteFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root removes a file from an unwritable directory regardless of its mode")
+	}
+
+	dir := filepath.Join(t.TempDir(), "locked")
+	gt.NoError(t, os.Mkdir(dir, 0o700))
+	path := filepath.Join(dir, "poll-cache.json")
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {}, withPollCachePath(path))
+	h.authenticate(t)
+	gt.NoError(t, h.cache.Save(&model.PollSnapshot{SavedAt: fixedNow}))
+
+	gt.NoError(t, os.Chmod(dir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	err := h.uc.Logout(t.Context())
+	gt.Error(t, err)
+
+	// The token is gone either way; only the file is left behind.
+	gt.False(t, h.uc.Authenticated())
+	gt.Equal(t, h.tokens.deletes, 1)
+
+	msg, ok := model.UserMessageOf(err)
+	gt.True(t, ok)
+	gt.S(t, msg.Summary).Contains("signed out")
+	gt.S(t, msg.Action).Contains(path)
+}
+
+func TestUnauthorizedPollDeletesSavedList(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	h.authenticate(t)
+	gt.NoError(t, h.cache.Save(&model.PollSnapshot{
+		SavedAt:       fixedNow,
+		Notifications: []model.Notification{{ID: "1", UpdatedAt: fixedNow}},
+	}))
+
+	_, err := h.uc.Poll(t.Context(), model.PollState{})
+	gt.Error(t, err)
+
+	// The list belongs to a token GitHub no longer accepts.
+	_, ok := h.savedList(t)
+	gt.False(t, ok)
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/m-mizutani/goerr/v2"
 	"github.com/m-mizutani/gt"
 	"github.com/m-mizutani/octify/pkg/domain/model"
+	"github.com/m-mizutani/octify/pkg/infra/pollcache"
 	"github.com/m-mizutani/octify/pkg/infra/readstate"
 	"github.com/m-mizutani/octify/pkg/infra/tokenstore"
 	"github.com/m-mizutani/octify/pkg/usecase"
@@ -71,12 +72,33 @@ type harness struct {
 	uc     *usecase.UseCase
 	tokens *fakeTokenStore
 	reads  *readstate.Store
-	slept  []time.Duration
+	// cache is nil when the harness was built with withoutPollCache.
+	cache *pollcache.Store
+	slept []time.Duration
 }
 
-type harnessOption func(*usecase.Config)
+type harnessOption func(*harnessOptions)
 
-func withConfig(fn func(*usecase.Config)) harnessOption { return fn }
+type harnessOptions struct {
+	cfg usecase.Config
+	// cachePath is empty when the use case gets no poll cache at all.
+	cachePath string
+}
+
+func withConfig(fn func(*usecase.Config)) harnessOption {
+	return func(o *harnessOptions) { fn(&o.cfg) }
+}
+
+// withPollCachePath points the saved list at a path of the test's choosing,
+// which is how a save is made to fail.
+func withPollCachePath(path string) harnessOption {
+	return func(o *harnessOptions) { o.cachePath = path }
+}
+
+// withoutPollCache builds the use case the way --no-cache does.
+func withoutPollCache() harnessOption {
+	return func(o *harnessOptions) { o.cachePath = "" }
+}
 
 func newHarness(t *testing.T, handler http.HandlerFunc, opts ...harnessOption) *harness {
 	t.Helper()
@@ -98,19 +120,36 @@ func newHarness(t *testing.T, handler http.HandlerFunc, opts ...harnessOption) *
 		ArchiveGap:  time.Second,
 		StateTTL:    30 * 24 * time.Hour,
 	}
+	settings := harnessOptions{
+		cfg:       cfg,
+		cachePath: filepath.Join(t.TempDir(), "poll-cache.json"),
+	}
 	for _, opt := range opts {
-		opt(&cfg)
+		opt(&settings)
 	}
 
 	h := &harness{tokens: &fakeTokenStore{}, reads: reads}
-	h.uc = usecase.New(h.tokens, reads, cfg,
+	ucOpts := []usecase.Option{
 		usecase.WithHTTPClient(srv.Client()),
 		usecase.WithClock(nowFunc),
 		usecase.WithSleep(func(ctx context.Context, d time.Duration) {
 			h.slept = append(h.slept, d)
 		}),
-	)
+	}
+	if settings.cachePath != "" {
+		h.cache = pollcache.New(settings.cachePath, "github.com")
+		ucOpts = append(ucOpts, usecase.WithPollCache(h.cache))
+	}
+
+	h.uc = usecase.New(h.tokens, reads, settings.cfg, ucOpts...)
 	return h
+}
+
+// savedList reports what the poll cache holds, and whether it holds anything.
+func (h *harness) savedList(t *testing.T) (*model.PollSnapshot, bool) {
+	t.Helper()
+	snap := gt.R1(h.cache.Load()).NoError(t)
+	return snap, snap != nil
 }
 
 // authenticate gives the use case a working GitHub client.
