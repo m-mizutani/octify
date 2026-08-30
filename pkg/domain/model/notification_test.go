@@ -149,7 +149,7 @@ func TestNotificationPullRequestRef(t *testing.T) {
 	testCases := map[string]struct {
 		notification model.Notification
 		wantOK       bool
-		wantRef      model.PullRequestRef
+		wantRef      model.SubjectRef
 	}{
 		"pull request with number": {
 			notification: model.Notification{
@@ -157,7 +157,7 @@ func TestNotificationPullRequestRef(t *testing.T) {
 				Subject: model.Subject{Type: types.SubjectPullRequest, Number: 12},
 			},
 			wantOK:  true,
-			wantRef: model.PullRequestRef{Repo: "acme/tools", Number: 12},
+			wantRef: model.SubjectRef{Repo: "acme/tools", Number: 12},
 		},
 		"issue is not a pull request": {
 			notification: model.Notification{
@@ -187,13 +187,87 @@ func TestNotificationPullRequestRef(t *testing.T) {
 	}
 }
 
+func TestNotificationSubjectRef(t *testing.T) {
+	testCases := map[string]struct {
+		notification model.Notification
+		wantOK       bool
+		wantRef      model.SubjectRef
+	}{
+		"pull request with number": {
+			notification: model.Notification{
+				Repo:    model.Repository{FullName: "acme/tools"},
+				Subject: model.Subject{Type: types.SubjectPullRequest, Number: 12},
+			},
+			wantOK:  true,
+			wantRef: model.SubjectRef{Repo: "acme/tools", Number: 12},
+		},
+		"issue with number": {
+			notification: model.Notification{
+				Repo:    model.Repository{FullName: "acme/tools"},
+				Subject: model.Subject{Type: types.SubjectIssue, Number: 7},
+			},
+			wantOK:  true,
+			wantRef: model.SubjectRef{Repo: "acme/tools", Number: 7},
+		},
+		"check suite carries no resolvable subject": {
+			notification: model.Notification{
+				Repo:    model.Repository{FullName: "acme/tools"},
+				Subject: model.Subject{Type: types.SubjectCheckSuite, Number: 12},
+			},
+		},
+		"workflow run carries no resolvable subject": {
+			notification: model.Notification{
+				Repo:    model.Repository{FullName: "acme/tools"},
+				Subject: model.Subject{Type: types.SubjectWorkflowRun, Number: 12},
+			},
+		},
+		"release carries no resolvable subject": {
+			notification: model.Notification{
+				Repo:    model.Repository{FullName: "acme/tools"},
+				Subject: model.Subject{Type: types.SubjectRelease, Number: 12},
+			},
+		},
+		"discussion carries no resolvable subject": {
+			notification: model.Notification{
+				Repo:    model.Repository{FullName: "acme/tools"},
+				Subject: model.Subject{Type: types.SubjectDiscussion, Number: 12},
+			},
+		},
+		"commit carries no resolvable subject": {
+			notification: model.Notification{
+				Repo:    model.Repository{FullName: "acme/tools"},
+				Subject: model.Subject{Type: types.SubjectCommit, Number: 12},
+			},
+		},
+		"missing number": {
+			notification: model.Notification{
+				Repo:    model.Repository{FullName: "acme/tools"},
+				Subject: model.Subject{Type: types.SubjectIssue},
+			},
+		},
+		"missing repository": {
+			notification: model.Notification{
+				Subject: model.Subject{Type: types.SubjectIssue, Number: 12},
+			},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			ref, ok := tc.notification.SubjectRef()
+			gt.Equal(t, ok, tc.wantOK)
+			gt.Equal(t, ref, tc.wantRef)
+		})
+	}
+}
+
 func TestReviewRequestsHas(t *testing.T) {
-	ref := model.PullRequestRef{Repo: "acme/tools", Number: 12}
+	ref := model.SubjectRef{Repo: "acme/tools", Number: 12}
 	reviews := model.ReviewRequests{ref: struct{}{}}
 
 	gt.True(t, reviews.Has(ref))
-	gt.False(t, reviews.Has(model.PullRequestRef{Repo: "acme/other", Number: 12}))
-	gt.False(t, reviews.Has(model.PullRequestRef{Repo: "acme/tools", Number: 13}))
+	gt.False(t, reviews.Has(model.SubjectRef{Repo: "acme/other", Number: 12}))
+	gt.False(t, reviews.Has(model.SubjectRef{Repo: "acme/tools", Number: 13}))
 
 	var empty model.ReviewRequests
 	gt.False(t, empty.Has(ref))

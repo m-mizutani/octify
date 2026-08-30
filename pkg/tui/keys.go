@@ -1,6 +1,9 @@
 package tui
 
-import "charm.land/bubbles/v2/key"
+import (
+	"charm.land/bubbles/v2/key"
+	"charm.land/lipgloss/v2"
+)
 
 // prefix keys start a two-stroke binding. There is no timeout: the next key
 // press always resolves them.
@@ -69,6 +72,28 @@ func defaultKeyMap() keyMap {
 type helpEntry struct {
 	keys string
 	desc string
+}
+
+// legendEntry is one row of the marker legend. It carries a style because the
+// legend has to show the colour the list uses, not just the shape.
+type legendEntry struct {
+	symbol string
+	style  lipgloss.Style
+	desc   string
+}
+
+// markerLegend explains the marker columns. The keys help lists what to press;
+// this lists what the row is telling you.
+func markerLegend() []legendEntry {
+	return []legendEntry{
+		{authorBar, styleAuthorBar, "you opened it"},
+		{"x", styleSelected, "selected"},
+		{"●", styleUnread, "unread"},
+		{"○", styleRead, "read"},
+		{"R", styleReview, "review requested"},
+		{"M", styleMerged, "merged"},
+		{"C", styleClosed, "closed without merging"},
+	}
 }
 
 func (k keyMap) helpEntries() []helpEntry {

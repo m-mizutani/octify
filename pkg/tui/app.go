@@ -67,6 +67,7 @@ type Model struct {
 
 	all        []model.Notification
 	reviews    model.ReviewRequests
+	states     model.SubjectStates
 	pollState  model.PollState
 	nextPollAt time.Time
 
@@ -103,6 +104,7 @@ func NewModel(ctx context.Context, uc *usecase.UseCase, cfg Config) Model {
 		showRead: cfg.ShowRead,
 		selected: make(map[types.ThreadID]struct{}),
 		reviews:  model.ReviewRequests{},
+		states:   model.SubjectStates{},
 	}
 }
 
@@ -353,6 +355,7 @@ func (m *Model) applyNotifications(res *usecase.PollResult) {
 
 	m.all = res.Notifications
 	m.reviews = res.ReviewRequests
+	m.states = res.SubjectStates
 
 	alive := make(map[types.ThreadID]struct{}, len(m.all))
 	for _, n := range m.all {

@@ -57,7 +57,7 @@ func (c *Client) ListReviewRequestedPullRequests(ctx context.Context) (model.Rev
 			if full == "" || item.Number <= 0 {
 				continue
 			}
-			out[model.PullRequestRef{Repo: full, Number: item.Number}] = struct{}{}
+			out[model.SubjectRef{Repo: full, Number: item.Number}] = struct{}{}
 		}
 
 		if next == 0 {

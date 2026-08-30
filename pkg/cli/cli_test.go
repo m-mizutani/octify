@@ -223,6 +223,39 @@ func TestFlagOverridesEnvironment(t *testing.T) {
 	gt.NoError(t, err)
 }
 
+// GitHub Enterprise Server puts GraphQL on a different path than REST, so the
+// endpoint has to be configurable on its own rather than derived from
+// --api-base.
+func TestGraphQLBaseFlag(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		cfg := gt.R1(cli.ConfigForTest(t.Context(), []string{"octify"})).NoError(t)
+		gt.Equal(t, cfg.GraphQLBase, gh.DefaultGraphQLBase)
+	})
+
+	t.Run("flag", func(t *testing.T) {
+		cfg := gt.R1(cli.ConfigForTest(t.Context(), []string{
+			"octify", "--graphql-base", "https://ghe.example.com/api/graphql",
+		})).NoError(t)
+		gt.Equal(t, cfg.GraphQLBase, "https://ghe.example.com/api/graphql")
+		// The REST root is untouched by it.
+		gt.Equal(t, cfg.APIBase, gh.DefaultAPIBase)
+	})
+
+	t.Run("environment", func(t *testing.T) {
+		t.Setenv("OCTIFY_GRAPHQL_BASE", "https://from-env.example.com/api/graphql")
+		cfg := gt.R1(cli.ConfigForTest(t.Context(), []string{"octify"})).NoError(t)
+		gt.Equal(t, cfg.GraphQLBase, "https://from-env.example.com/api/graphql")
+	})
+
+	t.Run("flag wins over environment", func(t *testing.T) {
+		t.Setenv("OCTIFY_GRAPHQL_BASE", "https://from-env.example.com/api/graphql")
+		cfg := gt.R1(cli.ConfigForTest(t.Context(), []string{
+			"octify", "--graphql-base", "https://from-flag.example.com/api/graphql",
+		})).NoError(t)
+		gt.Equal(t, cfg.GraphQLBase, "https://from-flag.example.com/api/graphql")
+	})
+}
+
 // A blank default would mean `go install` produces a binary that cannot sign
 // in — the failure the compiled-in ID exists to prevent.
 func TestDefaultClientIDIsCompiledIn(t *testing.T) {

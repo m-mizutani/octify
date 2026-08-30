@@ -72,6 +72,7 @@ func (u *UseCase) useCredential(cred *model.Credential) {
 	u.setClient(gh.New(cred.AccessToken,
 		gh.WithHTTPClient(u.hc),
 		gh.WithAPIBase(u.cfg.APIBase),
+		gh.WithGraphQLBase(u.cfg.GraphQLBase),
 	))
 }
 

@@ -42,9 +42,9 @@ func TestListReviewRequestedPullRequests(t *testing.T) {
 
 	// The third item has no pull_request object, so it is an issue and is skipped.
 	gt.Equal(t, len(reviews), 2)
-	gt.True(t, reviews.Has(model.PullRequestRef{Repo: "m-mizutani/octify", Number: 123}))
-	gt.True(t, reviews.Has(model.PullRequestRef{Repo: "acme/tools", Number: 7}))
-	gt.False(t, reviews.Has(model.PullRequestRef{Repo: "acme/tools", Number: 45}))
+	gt.True(t, reviews.Has(model.SubjectRef{Repo: "m-mizutani/octify", Number: 123}))
+	gt.True(t, reviews.Has(model.SubjectRef{Repo: "acme/tools", Number: 7}))
+	gt.False(t, reviews.Has(model.SubjectRef{Repo: "acme/tools", Number: 45}))
 }
 
 func TestListReviewRequestedPullRequestsEdgeCases(t *testing.T) {
@@ -113,7 +113,7 @@ func TestListReviewRequestedPullRequestsFollowsPagination(t *testing.T) {
 	// A missing marker reads as "no review needed", so every page has to be read.
 	gt.Equal(t, pages, 3)
 	gt.Equal(t, len(reviews), 3)
-	gt.True(t, reviews.Has(model.PullRequestRef{Repo: "acme/tools", Number: 3}))
+	gt.True(t, reviews.Has(model.SubjectRef{Repo: "acme/tools", Number: 3}))
 }
 
 func TestListReviewRequestedPullRequestsStopsAtPageCap(t *testing.T) {

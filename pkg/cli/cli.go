@@ -49,6 +49,7 @@ type options struct {
 	interval       time.Duration
 	clientID       string
 	apiBase        string
+	graphqlBase    string
 	webBase        string
 	credentialFile string
 	noKeyring      bool
@@ -118,6 +119,13 @@ func (o *options) flags() []ucli.Flag {
 			Value:       gh.DefaultAPIBase,
 			Sources:     ucli.EnvVars("OCTIFY_API_BASE"),
 			Destination: &o.apiBase,
+		},
+		&ucli.StringFlag{
+			Name:        "graphql-base",
+			Usage:       "GitHub GraphQL endpoint; GitHub Enterprise Server serves it at https://HOST/api/graphql",
+			Value:       gh.DefaultGraphQLBase,
+			Sources:     ucli.EnvVars("OCTIFY_GRAPHQL_BASE"),
+			Destination: &o.graphqlBase,
 		},
 		&ucli.StringFlag{
 			Name:        "web-base",
@@ -358,17 +366,25 @@ func (o *options) build(ctx context.Context, requireReadState bool) (context.Con
 			slog.Any("error", err), slog.String("path", statePath))
 	}
 
-	uc := usecase.New(tokens, reads, usecase.Config{
+	uc := usecase.New(tokens, reads, o.usecaseConfig())
+	return ctx, uc, closer, nil
+}
+
+// usecaseConfig is where every flag turns into the configuration the deeper
+// layers see. It is separate from build so that a test can check the mapping
+// without standing up a token store and a state file.
+func (o *options) usecaseConfig() usecase.Config {
+	return usecase.Config{
 		ClientID:    o.clientID,
 		Scopes:      requiredScopes,
 		APIBase:     o.apiBase,
+		GraphQLBase: o.graphqlBase,
 		WebBase:     o.webBase,
 		MinInterval: o.interval,
 		MaxPages:    o.maxPages,
 		ArchiveGap:  o.archiveGap,
 		StateTTL:    o.stateTTL,
-	})
-	return ctx, uc, closer, nil
+	}
 }
 
 func runTUI(ctx context.Context, opt *options) error {

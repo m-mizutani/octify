@@ -63,6 +63,10 @@ octify requests `repo` and `notifications`.
 it covers notifications from private repositories, and the review-request search
 needs to see private pull requests to mark them.
 
+The merged, closed and author markers come from one GraphQL query per poll. It
+needs no scope beyond `repo`, which already covers reading the same pull
+requests over REST.
+
 ## Usage
 
 ```
@@ -102,9 +106,33 @@ Notifications are split by what they point at: **PR**, **Issue**, **Actions**
 (check suites and workflow runs) and **Other** (commits, releases, discussions
 and anything new GitHub introduces). **All** holds everything.
 
-A pull request you are currently asked to review is marked `R`. That is the
-current state, not the reason the notification was created, so it disappears
-once you have reviewed.
+### Markers
+
+Each row opens with five marker columns.
+
+| Marker | Meaning |
+| --- | --- |
+| `▏` | You opened the pull request or issue |
+| `x` | Selected |
+| `●` / `○` | Unread / read |
+| `R` | You are currently asked to review it |
+| `M` | Merged |
+| `C` | Closed without being merged |
+
+A merged or closed row is drawn dim, so what still needs attention stands out.
+
+`R`, `M` and `C` are the **current** state, not the reason the notification was
+created: `R` disappears once you have reviewed, and a pull request merged in the
+browser turns `M` on the next poll. The author marker likewise comes from the
+pull request itself, not from the notification's `reason`, which reports only
+one cause and drops `author` as soon as you are also mentioned.
+
+Rows whose subject GitHub cannot resolve — check suites, workflow runs,
+releases, discussions and commits — carry no author bar and no state marker.
+The same is true for one polling cycle when the state lookup fails; the list
+itself is never lost over it.
+
+Press `?` for the same legend inside octify.
 
 ## Configuration
 
@@ -115,6 +143,7 @@ Every option is a flag with a matching environment variable. The flag wins.
 | `--interval` | `OCTIFY_INTERVAL` | `60s` | Lower bound for polling |
 | `--client-id` | `OCTIFY_CLIENT_ID` | compiled in | OAuth app client ID |
 | `--api-base` | `OCTIFY_API_BASE` | `https://api.github.com` | REST root |
+| `--graphql-base` | `OCTIFY_GRAPHQL_BASE` | `https://api.github.com/graphql` | GraphQL endpoint |
 | `--web-base` | `OCTIFY_WEB_BASE` | `https://github.com` | Web root |
 | `--credential-file` | `OCTIFY_CREDENTIAL_FILE` | see below | Token file, when no keychain |
 | `--no-keyring` | `OCTIFY_NO_KEYRING` | `false` | Never use the OS keychain |

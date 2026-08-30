@@ -142,7 +142,7 @@ func TestRenderShowsTheReviewMarker(t *testing.T) {
 	h.send(t, h.m.PollResultMsg(&usecase.PollResult{
 		Notifications: sampleList(),
 		ReviewRequests: model.ReviewRequests{
-			model.PullRequestRef{Repo: "acme/tools", Number: 1}: struct{}{},
+			model.SubjectRef{Repo: "acme/tools", Number: 1}: struct{}{},
 		},
 		NextInterval: time.Minute,
 	}, nil))

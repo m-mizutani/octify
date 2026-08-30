@@ -21,6 +21,12 @@ type PollResult struct {
 	// ReviewErr is set when only the review search failed. The notification list
 	// is still usable in that case.
 	ReviewErr error
+	// SubjectStates is what GitHub says about the issues and pull requests in
+	// Notifications. It is empty when the lookup failed.
+	SubjectStates model.SubjectStates
+	// StateErr is set when only the state lookup failed. The notification list
+	// is still usable in that case.
+	StateErr error
 	// Truncated is true when the page limit cut the list short.
 	Truncated bool
 	// Reconciled counts the read records dropped during this cycle.
@@ -108,6 +114,17 @@ func (u *UseCase) Poll(ctx context.Context, st model.PollState) (*PollResult, er
 		result.ReviewRequests = reviews
 	}
 
+	// The state lookup is treated like the search above: losing the markers for
+	// one cycle is cheaper than losing the list.
+	states, stateErr := client.ListSubjectStates(ctx, subjectRefs(notifications))
+	if stateErr != nil {
+		u.handleAuthFailure(ctx, stateErr)
+		result.SubjectStates = model.SubjectStates{}
+		result.StateErr = stateErr
+	} else {
+		result.SubjectStates = states
+	}
+
 	removed, reconcileErr := u.reads.Reconcile(notifications, readstate.ReconcileOption{
 		// Dropping records for notifications that were merely not fetched would
 		// silently mark them unread again.
@@ -120,6 +137,28 @@ func (u *UseCase) Poll(ctx context.Context, st model.PollState) (*PollResult, er
 
 	result.NextInterval = u.nextInterval(first.PollInterval, 0, 0)
 	return result, nil
+}
+
+// subjectRefs collects the issues and pull requests the list points at, in the
+// order they appear and without repeats. One subject can carry several
+// notification threads, and each of them would otherwise cost a slot in the
+// batched query.
+func subjectRefs(notifications []model.Notification) []model.SubjectRef {
+	seen := make(map[model.SubjectRef]struct{}, len(notifications))
+	out := make([]model.SubjectRef, 0, len(notifications))
+
+	for _, n := range notifications {
+		ref, ok := n.SubjectRef()
+		if !ok {
+			continue
+		}
+		if _, dup := seen[ref]; dup {
+			continue
+		}
+		seen[ref] = struct{}{}
+		out = append(out, ref)
+	}
+	return out
 }
 
 // failure builds the scheduling half of a failed cycle and rewrites the display
