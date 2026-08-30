@@ -32,6 +32,8 @@ func (m Model) Phase() Phase {
 	}
 }
 
+func (m Model) Polling() bool                { return m.polling }
+func (m Model) ShowingCache() bool           { return m.showingCache }
 func (m Model) Cursor() int                  { return m.cursor }
 func (m Model) Offset() int                  { return m.offset }
 func (m Model) CurrentTab() types.Tab        { return m.tab }
@@ -71,6 +73,12 @@ func (m Model) Archiving() bool {
 // Message constructors used by tests to drive Update directly.
 
 func RestoreMsg(err error) tea.Msg { return restoreMsg{err: err} }
+
+// RestoreMsgWithSnapshot is what start-up produces when a previous run left a
+// list behind.
+func RestoreMsgWithSnapshot(snap *model.PollSnapshot) tea.Msg {
+	return restoreMsg{snapshot: snap}
+}
 
 func DeviceCodeMsg(dc *gh.DeviceCode, err error) tea.Msg {
 	return deviceCodeMsg{dc: dc, err: err}

@@ -10,6 +10,7 @@ import (
 	"github.com/m-mizutani/gt"
 	"github.com/m-mizutani/octify/pkg/domain/model"
 	"github.com/m-mizutani/octify/pkg/domain/types"
+	"github.com/m-mizutani/octify/pkg/tui"
 	"github.com/m-mizutani/octify/pkg/usecase"
 )
 
@@ -323,6 +324,132 @@ func TestRenderAuthScreen(t *testing.T) {
 	out := stripANSI(h.m.Render())
 	gt.S(t, out).Contains("Not signed in")
 	gt.S(t, out).Contains("Press o to sign in")
+}
+
+// --- start-up ---
+
+func TestRenderSaysItIsLoadingBeforeTheFirstPoll(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 100, 20)
+
+	h.send(t, tui.RestoreMsgWithSnapshot(nil))
+
+	out := stripANSI(h.m.Render())
+	// "No unread notifications" would be a claim octify cannot make yet.
+	gt.S(t, out).Contains("Loading notifications…")
+	gt.S(t, out).NotContains("No unread notifications")
+	gt.S(t, lastLine(out)).Contains("loading…")
+}
+
+func TestRenderMarksTheSavedListWhileLoading(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 100, 20)
+
+	h.send(t, tui.RestoreMsgWithSnapshot(savedSnapshot(sampleList()...)))
+
+	out := stripANSI(h.m.Render())
+	gt.S(t, out).Contains("title of 1")
+	status := lastLine(out)
+	gt.S(t, status).Contains("loading…")
+	gt.S(t, status).Contains("saved list")
+
+	h.send(t, h.m.PollResultMsg(&usecase.PollResult{
+		Notifications:  sampleList(),
+		ReviewRequests: model.ReviewRequests{},
+		NextInterval:   time.Minute,
+	}, nil))
+
+	status = lastLine(stripANSI(h.m.Render()))
+	gt.S(t, status).NotContains("loading…")
+	gt.S(t, status).NotContains("saved list")
+}
+
+func TestRenderKeepsTheSavedListMarkAfterAFailedPoll(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 100, 20)
+	h.send(t, tui.RestoreMsgWithSnapshot(savedSnapshot(sampleList()...)))
+
+	h.send(t, h.m.PollResultMsg(&usecase.PollResult{NextInterval: time.Minute},
+		goerr.New("github is unreachable")))
+
+	status := lastLine(stripANSI(h.m.Render()))
+	gt.S(t, status).Contains("saved list")
+	gt.S(t, status).NotContains("loading…")
+}
+
+func TestRenderSaysItIsUpdatingOnARefresh(t *testing.T) {
+	h := newHarness(t)
+	h.loadList(t, sampleList()...)
+
+	h.send(t, press('r'))
+
+	status := lastLine(stripANSI(h.m.Render()))
+	// The list is already this session's, so it is an update rather than a load.
+	gt.S(t, status).Contains("updating…")
+	gt.S(t, status).NotContains("loading…")
+
+	h.send(t, h.m.PollResultMsg(&usecase.PollResult{
+		Notifications:  sampleList(),
+		ReviewRequests: model.ReviewRequests{},
+		NextInterval:   time.Minute,
+	}, nil))
+	gt.S(t, lastLine(stripANSI(h.m.Render()))).NotContains("updating…")
+}
+
+func TestRenderReadsTheSavedListThroughTheReadRecords(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 100, 20)
+
+	saved := sampleList()
+	gt.NoError(t, h.uc.SetReadState(model.ReadStateRead, saved[:1]))
+
+	h.send(t, tui.RestoreMsgWithSnapshot(savedSnapshot(saved...)))
+
+	// The record was written before this run started, so the restored row has to
+	// come back read rather than as GitHub's unread flag says. Under the default
+	// unread-only view that means it is not drawn at all.
+	gt.S(t, stripANSI(h.m.Render())).NotContains("title of 1")
+
+	h.send(t, press('a'))
+	rows := strings.Split(stripANSI(h.m.Render()), "\n")
+	gt.S(t, rows[1]).Contains("title of 1")
+	gt.S(t, rows[1]).Contains("○")
+	gt.S(t, rows[2]).Contains("●")
+}
+
+func TestRenderReportsAFailedSave(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 200, 20)
+
+	saveErr := model.WithUserMessage(goerr.New("disk is full"), model.UserMessage{
+		Summary: "could not save the notification list to /tmp/poll-cache.json",
+		Action:  "the next start may show an older list",
+	})
+	h.send(t, h.m.PollResultMsg(&usecase.PollResult{
+		Notifications:  sampleList(),
+		ReviewRequests: model.ReviewRequests{},
+		NextInterval:   time.Minute,
+		CacheErr:       saveErr,
+	}, nil))
+
+	gt.S(t, lastLine(stripANSI(h.m.Render()))).Contains("could not save the notification list")
+}
+
+func TestAFailedSaveIsTheLastThingReported(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 200, 20)
+
+	// Losing the markers changes what the user sees now; failing to save only
+	// changes what the next start sees.
+	h.send(t, h.m.PollResultMsg(&usecase.PollResult{
+		Notifications:  sampleList(),
+		ReviewRequests: model.ReviewRequests{},
+		NextInterval:   time.Minute,
+		StateErr:       goerr.New("graphql refused"),
+		CacheErr:       goerr.New("disk is full"),
+	}, nil))
+
+	gt.Equal(t, h.m.Status().Summary, "marker status unavailable")
 }
 
 func lastLine(s string) string {

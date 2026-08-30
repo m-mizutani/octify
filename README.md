@@ -72,9 +72,23 @@ requests over REST.
 ```
 octify                # open the list
 octify auth login     # sign in
-octify auth logout    # delete the saved token (read state is kept)
+octify auth logout    # delete the saved token and list (read state is kept)
 octify auth status    # show whether a token is saved, and where
 ```
+
+### Starting up
+
+octify saves the list from every poll that changed it, so a start opens on the
+notifications the last run ended with instead of an empty screen. Those rows are
+whatever GitHub last said, not a guess: the status line marks them `saved list`
+and replaces them the moment the first poll of the session answers, which it
+always asks for in full.
+
+The status line also says what octify is doing — `loading…` before the first
+answer of a session, `updating…` while a later poll is in flight.
+
+Turn the whole thing off with `--no-cache`: every start begins empty, and a file
+an earlier run left behind is removed.
 
 ### Keys
 
@@ -157,6 +171,8 @@ Every option is a flag with a matching environment variable. The flag wins.
 | `--no-keyring` | `OCTIFY_NO_KEYRING` | `false` | Never use the OS keychain |
 | `--state-file` | `OCTIFY_STATE_FILE` | see below | Read/unread records |
 | `--state-ttl` | `OCTIFY_STATE_TTL` | `720h` | How long a record outlives its notification |
+| `--cache-file` | `OCTIFY_CACHE_FILE` | see below | The list shown at the next start |
+| `--no-cache` | `OCTIFY_NO_CACHE` | `false` | Never save the list, and delete a saved one |
 | `--all` | `OCTIFY_ALL` | `false` | Start with read notifications shown |
 | `--max-pages` | `OCTIFY_MAX_PAGES` | `10` | Pages of 50 fetched per poll |
 | `--archive-gap` | `OCTIFY_ARCHIVE_GAP` | `1s` | Wait between bulk archive requests |
@@ -179,6 +195,11 @@ set:
 - `credential.json` — only when the OS keychain is unavailable. Mode `0600`;
   octify refuses to read it if anyone else can.
 - `read-state.json` — the read/unread records. Safe to delete.
+- `poll-cache.json` — the list from the last poll, which is what a start shows
+  before its own first poll answers. It holds the titles of everything in your
+  inbox, private repositories included, so it is written mode `0600`. Safe to
+  delete: the next poll writes it again. `auth logout` removes it, and so does
+  GitHub rejecting the token.
 
 ## Development
 

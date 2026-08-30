@@ -954,3 +954,152 @@ func TestQuitKeyIsTextWhileFiltering(t *testing.T) {
 	gt.True(t, cmd == nil)
 	gt.Equal(t, h.m.Filter(), "q")
 }
+
+// --- the saved list at start-up ---
+
+// savedSnapshot is what a previous run left behind.
+func savedSnapshot(ns ...model.Notification) *model.PollSnapshot {
+	return &model.PollSnapshot{
+		SavedAt:        fixedNow.Add(-time.Hour),
+		Notifications:  ns,
+		ReviewRequests: model.ReviewRequests{},
+		SubjectStates:  model.SubjectStates{},
+	}
+}
+
+func TestRestoreDrawsTheSavedList(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 100, 20)
+
+	h.send(t, tui.RestoreMsgWithSnapshot(savedSnapshot(sampleList()...)))
+
+	// The rows are there before this run has polled anything.
+	gt.Equal(t, h.m.VisibleIDs(), []types.ThreadID{"1", "2", "3", "4", "5"})
+	gt.Equal(t, h.m.Phase(), tui.PhaseLoading)
+	gt.True(t, h.m.ShowingCache())
+	gt.True(t, h.m.Polling())
+}
+
+func TestRestoreWithoutASavedList(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 100, 20)
+
+	h.send(t, tui.RestoreMsgWithSnapshot(nil))
+
+	gt.Equal(t, len(h.m.VisibleIDs()), 0)
+	gt.Equal(t, h.m.Phase(), tui.PhaseLoading)
+	gt.False(t, h.m.ShowingCache())
+	gt.True(t, h.m.Polling())
+}
+
+func TestRestoreOfAnEmptySavedList(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 100, 20)
+
+	h.send(t, tui.RestoreMsgWithSnapshot(savedSnapshot()))
+
+	// An empty saved list looks exactly like no saved list, so there is nothing
+	// to tell the user about.
+	gt.Equal(t, len(h.m.VisibleIDs()), 0)
+	gt.False(t, h.m.ShowingCache())
+}
+
+func TestFailedRestoreIgnoresTheSavedList(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 100, 20)
+
+	h.send(t, tui.RestoreMsg(goerr.New("no credential")))
+
+	gt.Equal(t, h.m.Phase(), tui.PhaseUnauthenticated)
+	gt.Equal(t, len(h.m.VisibleIDs()), 0)
+	gt.False(t, h.m.ShowingCache())
+	gt.False(t, h.m.Polling())
+	// A list nobody can act on is worse than the sign-in prompt.
+	gt.S(t, h.m.Render()).Contains("Press o to sign in")
+}
+
+func TestFirstPollReplacesTheSavedList(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 100, 20)
+	h.send(t, tui.RestoreMsgWithSnapshot(savedSnapshot(sampleList()...)))
+
+	h.send(t, h.m.PollResultMsg(&usecase.PollResult{
+		Notifications: []model.Notification{
+			notification("7", types.SubjectPullRequest, "acme/tools", 7, true),
+		},
+		ReviewRequests: model.ReviewRequests{},
+		NextInterval:   time.Minute,
+	}, nil))
+
+	gt.Equal(t, h.m.VisibleIDs(), []types.ThreadID{"7"})
+	gt.Equal(t, h.m.Phase(), tui.PhaseReady)
+	gt.False(t, h.m.ShowingCache())
+	gt.False(t, h.m.Polling())
+}
+
+func TestSavedListSurvivesAFailedFirstPoll(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 100, 20)
+	h.send(t, tui.RestoreMsgWithSnapshot(savedSnapshot(sampleList()...)))
+
+	h.send(t, h.m.PollResultMsg(&usecase.PollResult{NextInterval: time.Minute},
+		goerr.New("github is unreachable")))
+
+	// What is on screen is still the saved list, so it must still say so.
+	gt.Equal(t, h.m.VisibleIDs(), []types.ThreadID{"1", "2", "3", "4", "5"})
+	gt.True(t, h.m.ShowingCache())
+	gt.False(t, h.m.Polling())
+	gt.Equal(t, h.m.Phase(), tui.PhaseReady)
+}
+
+func TestRejectedTokenDropsTheSavedList(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 100, 20)
+	h.send(t, tui.RestoreMsgWithSnapshot(savedSnapshot(sampleList()...)))
+
+	h.send(t, h.m.PollResultMsg(&usecase.PollResult{NextInterval: time.Minute},
+		goerr.Wrap(gh.ErrUnauthorized, "rejected")))
+
+	gt.Equal(t, h.m.Phase(), tui.PhaseUnauthenticated)
+	gt.Equal(t, len(h.m.VisibleIDs()), 0)
+	gt.False(t, h.m.ShowingCache())
+}
+
+// --- polling in flight ---
+
+func TestManualRefreshMarksPollingInFlight(t *testing.T) {
+	h := newHarness(t)
+	h.loadList(t, sampleList()...)
+	gt.False(t, h.m.Polling())
+
+	h.send(t, press('r'))
+	gt.True(t, h.m.Polling())
+
+	h.send(t, h.m.PollResultMsg(&usecase.PollResult{
+		Notifications:  sampleList(),
+		ReviewRequests: model.ReviewRequests{},
+		NextInterval:   time.Minute,
+	}, nil))
+	gt.False(t, h.m.Polling())
+}
+
+func TestScheduledPollMarksPollingInFlight(t *testing.T) {
+	h := newHarness(t)
+	h.loadList(t, sampleList()...)
+
+	h.send(t, h.m.PollTickMsg())
+	gt.True(t, h.m.Polling())
+}
+
+func TestStaleResultLeavesTheRunningPollAlone(t *testing.T) {
+	h := newHarness(t)
+	h.loadList(t, sampleList()...)
+
+	// The refresh starts a new chain; the result of the one it replaced must
+	// not report that chain as finished.
+	stale := h.m.PollResultMsg(&usecase.PollResult{NextInterval: time.Minute}, nil)
+	h.send(t, press('r'))
+	h.send(t, stale)
+
+	gt.True(t, h.m.Polling())
+}

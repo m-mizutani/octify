@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/m-mizutani/octify/pkg/domain/types"
 	"github.com/m-mizutani/octify/pkg/infra/gh"
 	"github.com/m-mizutani/octify/pkg/usecase"
+	"github.com/m-mizutani/octify/pkg/utils/logging"
 )
 
 // slowDownPenalty is what GitHub documents for the device flow's slow_down
@@ -71,6 +73,13 @@ type Model struct {
 	pollState  model.PollState
 	nextPollAt time.Time
 
+	// polling is true while a poll is in flight, so the status line can say so
+	// instead of leaving the user guessing whether anything is happening.
+	polling bool
+	// showingCache is true while the rows on screen came from the list saved by
+	// a previous run rather than from a poll of this one.
+	showingCache bool
+
 	tab      types.Tab
 	cursor   int
 	offset   int
@@ -125,7 +134,13 @@ func Run(ctx context.Context, uc *usecase.UseCase, cfg Config) error {
 
 // --- messages ---
 
-type restoreMsg struct{ err error }
+// restoreMsg carries both halves of start-up: the credential, and the list a
+// previous run left behind. They travel together because the saved list is only
+// drawn once the credential is known to be there.
+type restoreMsg struct {
+	snapshot *model.PollSnapshot
+	err      error
+}
 type deviceCodeMsg struct {
 	dc  *gh.DeviceCode
 	err error
@@ -154,8 +169,17 @@ type openResultMsg struct{ err error }
 
 func (m Model) Init() tea.Cmd {
 	return func() tea.Msg {
-		_, _, err := m.uc.Restore(m.ctx)
-		return restoreMsg{err: err}
+		if _, _, err := m.uc.Restore(m.ctx); err != nil {
+			return restoreMsg{err: err}
+		}
+		// A saved list that cannot be read is replaced by the first poll a
+		// moment later, so it is logged rather than shown: there is nothing for
+		// the user to do about it.
+		snapshot, err := m.uc.Snapshot()
+		if err != nil {
+			logging.From(m.ctx).Warn("ignoring the saved notification list", slog.Any("error", err))
+		}
+		return restoreMsg{snapshot: snapshot}
 	}
 }
 
@@ -175,8 +199,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = messageOf(msg.err)
 			return m, nil
 		}
+		if msg.snapshot != nil {
+			m.applySnapshot(msg.snapshot)
+		}
 		m.phase = phaseLoading
-		return m, m.pollCmd()
+		return m, m.startPoll()
 
 	case deviceCodeMsg:
 		if msg.err != nil {
@@ -213,7 +240,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// A tick left over from a chain a manual refresh replaced.
 			return m, nil
 		}
-		return m, m.pollCmd()
+		return m, m.startPoll()
 
 	case pollResultMsg:
 		if msg.generation != m.pollGeneration {
@@ -245,11 +272,17 @@ func (m Model) pollCmd() tea.Cmd {
 	}
 }
 
+// startPoll dispatches a poll and records that one is in flight.
+func (m *Model) startPoll() tea.Cmd {
+	m.polling = true
+	return m.pollCmd()
+}
+
 // restartPolling abandons the pending chain and begins a new one, so that a
 // manual refresh replaces the schedule instead of running alongside it.
 func (m *Model) restartPolling() tea.Cmd {
 	m.pollGeneration++
-	return m.pollCmd()
+	return m.startPoll()
 }
 
 func (m Model) authAttemptCmd() tea.Cmd {
@@ -282,7 +315,7 @@ func (m Model) handleAuthResult(msg authResultMsg) (tea.Model, tea.Cmd) {
 		m.device = nil
 		m.phase = phaseLoading
 		m.status = model.UserMessage{}
-		return m, m.pollCmd()
+		return m, m.startPoll()
 
 	case errors.Is(msg.err, gh.ErrAuthorizationPending):
 		return m, tea.Tick(m.authInterval, func(time.Time) tea.Msg { return authTickMsg{} })
@@ -301,6 +334,8 @@ func (m Model) handleAuthResult(msg authResultMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handlePollResult(msg pollResultMsg) (tea.Model, tea.Cmd) {
+	m.polling = false
+
 	interval := time.Minute
 	if msg.res != nil {
 		interval = msg.res.NextInterval
@@ -311,6 +346,7 @@ func (m Model) handlePollResult(msg pollResultMsg) (tea.Model, tea.Cmd) {
 		if errors.Is(msg.err, gh.ErrUnauthorized) {
 			m.phase = phaseUnauthenticated
 			m.all = nil
+			m.showingCache = false
 			m.selected = make(map[types.ThreadID]struct{})
 			m.status = messageOf(msg.err)
 			return m, nil
@@ -326,6 +362,9 @@ func (m Model) handlePollResult(msg pollResultMsg) (tea.Model, tea.Cmd) {
 	}
 
 	m.phase = phaseReady
+	// Whatever is on screen from here on was confirmed by this cycle, whether it
+	// answered with a new list or with 304.
+	m.showingCache = false
 	m.nextPollAt = m.cfg.Now().Add(interval)
 
 	// A success always carries a result; the guard above exists for the failure
@@ -345,6 +384,21 @@ func (m Model) handlePollResult(msg pollResultMsg) (tea.Model, tea.Cmd) {
 func (m Model) scheduleNextPoll(d time.Duration) tea.Cmd {
 	generation := m.pollGeneration
 	return tea.Tick(d, func(time.Time) tea.Msg { return pollTickMsg{generation: generation} })
+}
+
+// applySnapshot draws the list a previous run saved, so the first seconds of a
+// session are not spent looking at an empty screen.
+//
+// The read records are already loaded by this point, so the unread markers on
+// these rows are the same ones the user left behind.
+func (m *Model) applySnapshot(snap *model.PollSnapshot) {
+	m.all = snap.Notifications
+	m.reviews = snap.ReviewRequests
+	m.states = snap.SubjectStates
+	// An empty saved list is indistinguishable from no saved list on screen, so
+	// there is nothing to announce.
+	m.showingCache = len(snap.Notifications) > 0
+	m.clampCursor()
 }
 
 // applyNotifications replaces the list wholesale: GitHub's response is the
@@ -584,6 +638,10 @@ func pollStatus(res *usecase.PollResult) model.UserMessage {
 		return model.UserMessage{Summary: "marker status unavailable"}
 	case res.Truncated:
 		return model.UserMessage{Summary: "showing the first " + strconv.Itoa(len(res.Notifications)) + " notifications"}
+	case res.CacheErr != nil:
+		// Last, because nothing about this session is worse for it: only the
+		// next start is.
+		return messageOf(res.CacheErr)
 	default:
 		return model.UserMessage{}
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/m-mizutani/octify/pkg/domain/model"
 	"github.com/m-mizutani/octify/pkg/domain/types"
 	"github.com/m-mizutani/octify/pkg/infra/gh"
+	"github.com/m-mizutani/octify/pkg/infra/pollcache"
 	"github.com/m-mizutani/octify/pkg/infra/readstate"
 	"github.com/m-mizutani/octify/pkg/infra/tokenstore"
 )
@@ -456,6 +458,75 @@ func callGitHubBody(t *testing.T, body string) error {
 	client := gh.New("t", gh.WithAPIBase(srv.URL), gh.WithHTTPClient(srv.Client()))
 	_, err := client.ListNotifications(t.Context(), gh.ListNotificationsInput{})
 	return err
+}
+
+func TestCachePathDefaults(t *testing.T) {
+	e := newEnv(t, githubHandler(t, nil))
+
+	paths := gt.R1(cli.PathsForTest(t.Context(), e.args())).NoError(t)
+	gt.Equal(t, paths.Cache, filepath.Join(e.dir, "octify", "poll-cache.json"))
+	// The other two are unchanged by the new one.
+	gt.Equal(t, paths.State, e.statePath())
+	gt.Equal(t, paths.Credential, e.credentialPath())
+}
+
+func TestCacheFileFlagBeatsEnvironment(t *testing.T) {
+	e := newEnv(t, githubHandler(t, nil))
+	t.Setenv("OCTIFY_CACHE_FILE", filepath.Join(e.dir, "from-env.json"))
+
+	fromEnv := gt.R1(cli.PathsForTest(t.Context(), e.args())).NoError(t)
+	gt.Equal(t, fromEnv.Cache, filepath.Join(e.dir, "from-env.json"))
+
+	fromFlag := gt.R1(cli.PathsForTest(t.Context(),
+		e.args("--cache-file", filepath.Join(e.dir, "from-flag.json")))).NoError(t)
+	gt.Equal(t, fromFlag.Cache, filepath.Join(e.dir, "from-flag.json"))
+}
+
+func TestNoCacheLeavesTheSavedListUnread(t *testing.T) {
+	e := newEnv(t, githubHandler(t, nil))
+	path := filepath.Join(e.dir, "octify", "poll-cache.json")
+
+	// A list saved by an earlier run, at the path the default would use.
+	saved := pollcache.New(path, hostOfTestServer(t, e.serverURL))
+	gt.NoError(t, saved.Save(&model.PollSnapshot{
+		SavedAt:       time.Now(),
+		Notifications: []model.Notification{{ID: "1", UpdatedAt: time.Now()}},
+	}))
+
+	withCache := gt.R1(cli.BuildForTest(t.Context(), e.args())).NoError(t)
+	restored := gt.R1(withCache.Snapshot()).NoError(t)
+	gt.NotNil(t, restored)
+
+	withoutCache := gt.R1(cli.BuildForTest(t.Context(), e.args("--no-cache"))).NoError(t)
+	// No store was wired in, so the file on disk is never even looked at.
+	gt.Nil(t, gt.R1(withoutCache.Snapshot()).NoError(t))
+}
+
+func TestNoCacheRemovesAListAnEarlierRunLeftBehind(t *testing.T) {
+	e := newEnv(t, githubHandler(t, nil))
+	path := filepath.Join(e.dir, "octify", "poll-cache.json")
+
+	saved := pollcache.New(path, hostOfTestServer(t, e.serverURL))
+	gt.NoError(t, saved.Save(&model.PollSnapshot{
+		SavedAt:       time.Now(),
+		Notifications: []model.Notification{{ID: "1", UpdatedAt: time.Now()}},
+	}))
+
+	gt.R1(cli.BuildForTest(t.Context(), e.args("--no-cache"))).NoError(t)
+
+	// The flag promises octify keeps no list on this machine, so a file an
+	// earlier run wrote has to go too — including one `auth logout` would
+	// otherwise leave for the next account that signs in.
+	_, err := os.Stat(path)
+	gt.True(t, os.IsNotExist(err))
+}
+
+// hostOfTestServer names the GitHub the test server stands in for, which is what
+// keys the saved list.
+func hostOfTestServer(t *testing.T, serverURL string) string {
+	t.Helper()
+	u := gt.R1(url.Parse(serverURL)).NoError(t)
+	return u.Host
 }
 
 func exchangeDeviceCode(t *testing.T, code string) error {

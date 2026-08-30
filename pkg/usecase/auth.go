@@ -58,12 +58,25 @@ func (u *UseCase) TryCompleteDeviceFlow(ctx context.Context, dc *gh.DeviceCode) 
 	return cred, backend, nil
 }
 
-// Logout drops the credential. The read records are deliberately left in place:
-// they are a separate concern and should survive signing back in.
+// Logout drops the credential and the saved notification list. The read records
+// are deliberately left in place: they are a separate concern and should
+// survive signing back in.
+//
+// The saved list is not, because it holds the titles of the account that is
+// being signed out of.
 func (u *UseCase) Logout(ctx context.Context) error {
-	u.setClient(nil)
+	snapshotErr := u.dropClientAndSnapshot()
+
 	if err := u.tokens.Delete(ctx); err != nil && !errors.Is(err, tokenstore.ErrNotFound) {
 		return err
+	}
+	if snapshotErr != nil {
+		// The token is gone, so this is not a failed sign-out; it is one file the
+		// user has to remove themselves.
+		return model.WithUserMessage(snapshotErr, model.UserMessage{
+			Summary: "signed out, but the saved notification list could not be deleted",
+			Action:  "remove " + u.cache.Path() + " by hand",
+		})
 	}
 	return nil
 }
@@ -80,6 +93,6 @@ func (u *UseCase) useCredential(cred *model.Credential) {
 // start goes through the device flow instead of failing again. It runs from the
 // archive goroutine as well as the polling one.
 func (u *UseCase) forgetCredential(ctx context.Context) {
-	u.setClient(nil)
+	_ = u.dropClientAndSnapshot()
 	_ = u.tokens.Delete(ctx)
 }

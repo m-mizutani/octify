@@ -43,6 +43,9 @@ type PollResult struct {
 	// Reconciled counts the read records dropped during this cycle.
 	Reconciled   int
 	ReconcileErr error
+	// CacheErr is set when only the snapshot could not be saved. Nothing about
+	// this cycle is lost by it; the next start just has nothing to draw.
+	CacheErr     error
 	NextInterval time.Duration
 	NextState    model.PollState
 }
@@ -55,8 +58,9 @@ type PollResult struct {
 // is returned alongside and must not be ignored.
 func (u *UseCase) Poll(ctx context.Context, st model.PollState) (*PollResult, error) {
 	// Hold on to one pointer for the whole cycle: a sign-out from the archive
-	// goroutine must not turn it into nil halfway through.
-	client := u.currentClient()
+	// goroutine must not turn it into nil halfway through. The sequence number
+	// is what keeps this cycle from saving over a newer one.
+	client, seq := u.beginPoll()
 	if client == nil {
 		err := notAuthenticated()
 		return u.failure(st, 0, err), err
@@ -156,9 +160,53 @@ func (u *UseCase) Poll(ctx context.Context, st model.PollState) (*PollResult, er
 	})
 	result.Reconciled = removed
 	result.ReconcileErr = reconcileErr
+	result.CacheErr = u.saveSnapshot(seq, result)
 
 	result.NextInterval = u.nextInterval(first.PollInterval, 0, 0)
 	return result, nil
+}
+
+// Snapshot returns the list saved by the last cycle of a previous run, so the
+// caller has something to draw before its own first poll answers.
+//
+// A missing or unusable file is not an error the user can act on, so it is
+// reported as (nil, err) and the caller is expected to carry on without it.
+func (u *UseCase) Snapshot() (*model.PollSnapshot, error) {
+	if u.cache == nil {
+		return nil, nil
+	}
+	return u.cache.Load()
+}
+
+// saveSnapshot records what this cycle put on screen, markers included.
+//
+// A cycle whose review search or state lookup failed is saved with those
+// markers empty, exactly as it is drawn: restoring a fuller picture than the
+// one the user last saw would make the next start disagree with the screen they
+// left behind.
+//
+// Two cycles never fight over the file. The lock is the same one the credential
+// is guarded by, so a cycle that ran while GitHub rejected the token finds no
+// client and writes nothing, and a cycle overtaken by a newer one finds a
+// higher savedSeq and leaves that newer list in place.
+func (u *UseCase) saveSnapshot(seq uint64, res *PollResult) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.cache == nil || u.client == nil || seq < u.savedSeq {
+		return nil
+	}
+
+	if err := u.cache.Save(&model.PollSnapshot{
+		SavedAt:        u.now(),
+		Notifications:  res.Notifications,
+		ReviewRequests: res.ReviewRequests,
+		SubjectStates:  res.SubjectStates,
+	}); err != nil {
+		return err
+	}
+	u.savedSeq = seq
+	return nil
 }
 
 // subjectRefs collects the issues and pull requests the list points at, in the

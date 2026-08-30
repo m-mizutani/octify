@@ -13,6 +13,7 @@ import (
 	"github.com/m-mizutani/goerr/v2"
 	"github.com/m-mizutani/octify/pkg/domain/model"
 	"github.com/m-mizutani/octify/pkg/infra/gh"
+	"github.com/m-mizutani/octify/pkg/infra/pollcache"
 	"github.com/m-mizutani/octify/pkg/infra/readstate"
 	"github.com/m-mizutani/octify/pkg/infra/tokenstore"
 	"github.com/m-mizutani/octify/pkg/tui"
@@ -55,6 +56,8 @@ type options struct {
 	noKeyring      bool
 	stateFile      string
 	stateTTL       time.Duration
+	cacheFile      string
+	noCache        bool
 	all            bool
 	maxPages       int
 	archiveGap     time.Duration
@@ -158,6 +161,18 @@ func (o *options) flags() []ucli.Flag {
 			Value:       720 * time.Hour,
 			Sources:     ucli.EnvVars("OCTIFY_STATE_TTL"),
 			Destination: &o.stateTTL,
+		},
+		&ucli.StringFlag{
+			Name:        "cache-file",
+			Usage:       "where the last poll's notification list is saved, so the next start has something to show",
+			Sources:     ucli.EnvVars("OCTIFY_CACHE_FILE"),
+			Destination: &o.cacheFile,
+		},
+		&ucli.BoolFlag{
+			Name:        "no-cache",
+			Usage:       "never save the notification list; every start begins with an empty list",
+			Sources:     ucli.EnvVars("OCTIFY_NO_CACHE"),
+			Destination: &o.noCache,
 		},
 		&ucli.BoolFlag{
 			Name:        "all",
@@ -294,10 +309,10 @@ func configDir() (string, error) {
 	return filepath.Join(base, "octify"), nil
 }
 
-func (o *options) resolvePaths() (credentialPath, statePath string, err error) {
+func (o *options) resolvePaths() (credentialPath, statePath, cachePath string, err error) {
 	dir, err := configDir()
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	credentialPath = o.credentialFile
 	if credentialPath == "" {
@@ -307,7 +322,11 @@ func (o *options) resolvePaths() (credentialPath, statePath string, err error) {
 	if statePath == "" {
 		statePath = filepath.Join(dir, "read-state.json")
 	}
-	return credentialPath, statePath, nil
+	cachePath = o.cacheFile
+	if cachePath == "" {
+		cachePath = filepath.Join(dir, "poll-cache.json")
+	}
+	return credentialPath, statePath, cachePath, nil
 }
 
 // setupLogger opens the log destination. The returned closer is nil when logs
@@ -357,7 +376,7 @@ func (o *options) build(ctx context.Context, requireReadState bool) (context.Con
 	}
 	ctx = logging.With(ctx, logger)
 
-	credentialPath, statePath, err := o.resolvePaths()
+	credentialPath, statePath, cachePath, err := o.resolvePaths()
 	if err != nil {
 		return ctx, nil, closer, err
 	}
@@ -383,7 +402,22 @@ func (o *options) build(ctx context.Context, requireReadState bool) (context.Con
 			slog.Any("error", err), slog.String("path", statePath))
 	}
 
-	uc := usecase.New(tokens, reads, o.usecaseConfig())
+	cache := pollcache.New(cachePath, host)
+
+	var ucOpts []usecase.Option
+	if o.noCache {
+		// --no-cache says octify keeps no list on this machine, which has to
+		// cover one an earlier run without the flag left behind. Failing to
+		// remove it is not worth refusing the command over.
+		if err := cache.Delete(); err != nil {
+			logging.From(ctx).Warn("could not remove the saved notification list",
+				slog.Any("error", err), slog.String("path", cachePath))
+		}
+	} else {
+		ucOpts = append(ucOpts, usecase.WithPollCache(cache))
+	}
+
+	uc := usecase.New(tokens, reads, o.usecaseConfig(), ucOpts...)
 	return ctx, uc, closer, nil
 }
 
