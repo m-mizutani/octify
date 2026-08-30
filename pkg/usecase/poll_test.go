@@ -137,6 +137,71 @@ func TestPollNotModifiedSkipsSearch(t *testing.T) {
 	gt.Equal(t, stateCalls, 0)
 }
 
+// A conditional request that keeps answering 304 never reaches the state
+// lookup, so a pull request merged without its thread being touched would keep
+// a stale marker forever. The streak eventually forces an unconditional cycle.
+func TestPollRefreshesAfterAStreakOfNotModified(t *testing.T) {
+	var conditional []bool
+	stateCalls := 0
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/notifications":
+			asked := r.Header.Get("If-Modified-Since") != ""
+			conditional = append(conditional, asked)
+			if asked {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			w.Header().Set("Last-Modified", "Mon, 25 Aug 2026 08:55:12 GMT")
+			_, _ = w.Write([]byte("[" + notificationJSON("1", fixedNow) + "]"))
+		case "/search/issues":
+			emptySearch(w)
+		case "/graphql":
+			stateCalls++
+			statesJSON(t, w, r)
+		}
+	})
+	h.authenticate(t)
+
+	st := model.PollState{LastModified: "prev"}
+	for i := 0; i < 10; i++ {
+		res := gt.R1(h.uc.Poll(t.Context(), st)).NoError(t)
+		gt.True(t, res.NotModified)
+		gt.Equal(t, res.NextState.NotModifiedStreak, i+1)
+		st = res.NextState
+	}
+
+	// Ten cycles cost nothing at all.
+	gt.Equal(t, stateCalls, 0)
+
+	// The eleventh asks unconditionally and the markers come back.
+	res := gt.R1(h.uc.Poll(t.Context(), st)).NoError(t)
+	gt.False(t, res.NotModified)
+	gt.Equal(t, stateCalls, 1)
+	gt.Equal(t, len(res.SubjectStates), 1)
+
+	// A full answer starts the count over.
+	gt.Equal(t, res.NextState.NotModifiedStreak, 0)
+	gt.Equal(t, res.NextState.LastModified, "Mon, 25 Aug 2026 08:55:12 GMT")
+
+	gt.Equal(t, conditional, []bool{true, true, true, true, true, true, true, true, true, true, false})
+}
+
+// A failed cycle answered nothing, so it must not push the unconditional
+// refresh further away.
+func TestPollFailureKeepsTheNotModifiedStreak(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	h.authenticate(t)
+
+	res, err := h.uc.Poll(t.Context(), model.PollState{NotModifiedStreak: 7})
+	gt.Error(t, err)
+	gt.Equal(t, res.NextState.NotModifiedStreak, 7)
+	gt.Equal(t, res.NextState.Failures, 1)
+}
+
 func TestPollNextInterval(t *testing.T) {
 	testCases := map[string]struct {
 		minInterval  time.Duration

@@ -126,11 +126,13 @@ created, so `R` disappears once you have reviewed. The author marker likewise
 comes from the pull request itself, not from the notification's `reason`, which
 reports only one cause and drops `author` as soon as you are also mentioned.
 
-They refresh on every poll **that returns a changed notification list**. A poll
+They refresh on every poll that returns a changed notification list. A poll
 GitHub answers with `304 Not Modified` costs no requests at all, markers
-included, so a pull request whose thread has not been touched since — one you
-merged yourself, for instance, since GitHub does not notify you of your own
-actions — keeps its old marker until something else changes the list.
+included — but the markers come from the pull requests themselves, not from the
+notification threads, so one can be merged without its thread being touched
+(GitHub does not notify you of your own actions). After ten such cycles in a
+row, octify asks unconditionally, which refreshes everything. A marker is
+therefore at most ten polls behind.
 
 Rows whose subject GitHub cannot resolve — check suites, workflow runs,
 releases, discussions and commits — carry no author bar and no state marker.
