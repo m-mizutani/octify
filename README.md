@@ -188,11 +188,35 @@ connect to — but the toast itself is drawn over whatever is on screen, so it i
 visible while you are in another pane, sharing your screen or recording your
 terminal. `--no-herdr` turns it off.
 
-octify reads `HERDR_ENV`, `HERDR_SOCKET_PATH`, `HERDR_SESSION` and
-`XDG_CONFIG_HOME` to find the session. It writes nothing to them. Where the
-toast appears is herdr's `ui.toast` setting, which octify does not override.
+octify reads `HERDR_ENV`, `HERDR_SOCKET_PATH`, `HERDR_SESSION`, `HERDR_PANE_ID`
+and `XDG_CONFIG_HOME` to find the session and the pane. It writes nothing to
+them. Where the toast appears is herdr's `ui.toast` setting, which octify does
+not override.
 
-Turn it off with `--no-herdr`. Give it a sound with `--herdr-sound=done`.
+### In the agent list
+
+octify also puts itself in herdr's agent list, beside the coding agents herdr
+recognizes on its own, so a glance shows how much is waiting without switching
+panes.
+
+| octify | herdr shows |
+| --- | --- |
+| Not signed in | `idle` · not signed in |
+| Waiting for you to enter the device code | `blocked` · waiting for the device code |
+| Waiting for its first list | `working` · loading |
+| Nothing unread | `idle` · 0 unread |
+| 12 unread | `blocked` · 12 unread |
+
+`blocked` is what herdr calls an agent that cannot go further without you, which
+is what unread notifications are.
+
+The entry is withdrawn when octify exits, whether by `q`, `ctrl+c` or `SIGTERM`.
+**A kill leaves it behind**: the report reaches herdr over a connection that
+closes immediately, so herdr has no way to notice the process is gone. Running
+octify in that pane again replaces the entry, and closing the pane removes it.
+
+`--no-herdr` turns off both the toasts and the agent list entry.
+`--herdr-sound=done` gives the toast a sound.
 
 ## Configuration
 
@@ -214,7 +238,7 @@ Every option is a flag with a matching environment variable. The flag wins.
 | `--all` | `OCTIFY_ALL` | `false` | Start with read notifications shown |
 | `--max-pages` | `OCTIFY_MAX_PAGES` | `10` | Pages of 50 fetched per poll |
 | `--archive-gap` | `OCTIFY_ARCHIVE_GAP` | `1s` | Wait between bulk archive requests |
-| `--no-herdr` | `OCTIFY_NO_HERDR` | `false` | Never show a desktop notification |
+| `--no-herdr` | `OCTIFY_NO_HERDR` | `false` | Never reach herdr: no toast, no agent list entry |
 | `--herdr-sound` | `OCTIFY_HERDR_SOUND` | `none` | `none`, `done` or `request` |
 | `--log-level` | `OCTIFY_LOG_LEVEL` | `warn` | `debug`, `info`, `warn`, `error` |
 | `--log-file` | `OCTIFY_LOG_FILE` | — | Without it, logs are discarded |

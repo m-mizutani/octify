@@ -19,6 +19,7 @@ func TestDetect(t *testing.T) {
 	testCases := map[string]struct {
 		env      map[string]string
 		wantPath string
+		wantPane string
 		wantOK   bool
 	}{
 		"outside herdr entirely": {
@@ -29,12 +30,23 @@ func TestDetect(t *testing.T) {
 			env:    map[string]string{"HERDR_ENV": "0", "HERDR_SOCKET_PATH": "/run/herdr.sock"},
 			wantOK: false,
 		},
-		"the socket path a managed pane carries": {
+		"the socket path and pane a managed pane carries": {
+			env: map[string]string{
+				"HERDR_ENV":         "1",
+				"HERDR_SOCKET_PATH": "/run/user/501/herdr.sock",
+				"HERDR_PANE_ID":     "w1:p3",
+			},
+			wantPath: "/run/user/501/herdr.sock",
+			wantPane: "w1:p3",
+			wantOK:   true,
+		},
+		"a session that carries no pane is still a session": {
 			env: map[string]string{
 				"HERDR_ENV":         "1",
 				"HERDR_SOCKET_PATH": "/run/user/501/herdr.sock",
 			},
 			wantPath: "/run/user/501/herdr.sock",
+			wantPane: "",
 			wantOK:   true,
 		},
 		"a named session without an explicit socket path": {
@@ -74,13 +86,26 @@ func TestDetect(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			// Every variable Detect reads is pinned, so the developer's own
 			// environment cannot decide the outcome.
-			for _, key := range []string{"HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_SESSION", "XDG_CONFIG_HOME", "HOME"} {
+			for _, key := range []string{"HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_SESSION", "HERDR_PANE_ID", "XDG_CONFIG_HOME", "HOME"} {
 				t.Setenv(key, tc.env[key])
 			}
 
-			path, ok := herdr.Detect()
+			sess, ok := herdr.Detect()
 			gt.Equal(t, tc.wantOK, ok)
-			gt.Equal(t, tc.wantPath, path)
+			gt.Equal(t, tc.wantPath, sess.Socket)
+			gt.Equal(t, tc.wantPane, sess.PaneID)
 		})
 	}
+}
+
+func TestStateValidate(t *testing.T) {
+	gt.NoError(t, herdr.StateIdle.Validate())
+	gt.NoError(t, herdr.StateWorking.Validate())
+	gt.NoError(t, herdr.StateBlocked.Validate())
+	gt.NoError(t, herdr.StateUnknown.Validate())
+
+	// done is what herdr derives from an unseen idle agent, not something a
+	// process may report.
+	gt.Error(t, herdr.State("done").Validate()).Is(herdr.ErrInvalidState)
+	gt.Error(t, herdr.State("").Validate()).Is(herdr.ErrInvalidState)
 }

@@ -74,21 +74,50 @@ type harness struct {
 	announcing  bool
 	announced   []toast
 	announceErr error
+
+	// reporting decides whether the model is given somewhere to report its
+	// activity and unread count.
+	reporting bool
+	reports   []report
+	reportErr error
+
+	// fastArchive lets archive requests answer at once instead of hanging, so a
+	// test may run the commands an archive produces rather than only feeding it
+	// events by hand.
+	fastArchive bool
 }
 
 type toast struct{ title, body string }
 
+type report struct {
+	seq      uint64
+	activity tui.Activity
+	unread   int
+}
+
 // withAnnounce builds the harness as a run inside a herdr pane.
 func withAnnounce(h *harness) { h.announcing = true }
+
+// withReport builds the harness as a run that can report to the workspace.
+func withReport(h *harness) { h.reporting = true }
+
+// withFastArchive lets archive requests finish instead of hanging.
+func withFastArchive(h *harness) { h.fastArchive = true }
 
 func newHarness(t *testing.T, opts ...func(*harness)) *harness {
 	t.Helper()
 
-	// Archive requests hang until the context ends. That keeps a started job in
-	// flight and silent, so a test can feed it the events it wants to examine
-	// without the real goroutine racing them onto the same channel.
+	h := &harness{}
+	for _, opt := range opts {
+		opt(h)
+	}
+
+	// Archive requests hang until the context ends by default. That keeps a
+	// started job in flight and silent, so a test can feed it the events it
+	// wants to examine without the real goroutine racing them onto the same
+	// channel.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
+		if r.Method == http.MethodDelete && !h.fastArchive {
 			<-r.Context().Done()
 			return
 		}
@@ -120,10 +149,7 @@ func newHarness(t *testing.T, opts ...func(*harness)) *harness {
 	_, _, restoreErr := uc.Restore(t.Context())
 	gt.NoError(t, restoreErr)
 
-	h := &harness{uc: uc}
-	for _, opt := range opts {
-		opt(h)
-	}
+	h.uc = uc
 
 	cfg := tui.Config{
 		WebBase: "https://github.com",
@@ -137,6 +163,12 @@ func newHarness(t *testing.T, opts ...func(*harness)) *harness {
 		cfg.Announce = func(ctx context.Context, title, body string) error {
 			h.announced = append(h.announced, toast{title: title, body: body})
 			return h.announceErr
+		}
+	}
+	if h.reporting {
+		cfg.Report = func(ctx context.Context, seq uint64, activity tui.Activity, unread int) error {
+			h.reports = append(h.reports, report{seq: seq, activity: activity, unread: unread})
+			return h.reportErr
 		}
 	}
 
@@ -1405,4 +1437,204 @@ func TestAnnounceText(t *testing.T) {
 		gt.Equal(t, "octify · 2 new notifications", title)
 		gt.Equal(t, "Fix the parser (+1 more)", body)
 	})
+}
+
+// --- reporting to the workspace ---
+
+// step drives one message and runs whatever it produced, so what the harness
+// records is what a running program would have done.
+func (h *harness) step(t *testing.T, msg tea.Msg) {
+	t.Helper()
+	runCmd(t, h.send(t, msg))
+}
+
+// ready puts the model into the ready state with the given list and clears the
+// reports that getting there produced, so a test can look only at what follows.
+func (h *harness) ready(t *testing.T, ns ...model.Notification) {
+	t.Helper()
+	h.step(t, tea.WindowSizeMsg{Width: 100, Height: 20})
+	runCmd(t, h.poll(t, ns...))
+	gt.Equal(t, h.m.Phase(), tui.PhaseReady)
+	h.reports = nil
+}
+
+func TestNoReportWithoutSomewhereToSendOne(t *testing.T) {
+	h := newHarness(t)
+	h.ready(t, sampleList()...)
+
+	h.step(t, press('I'))
+	runCmd(t, h.poll(t, sampleList()[:2]...))
+
+	gt.Equal(t, 0, len(h.reports))
+}
+
+func TestTheFirstMessageReportsWhatOctifyIsDoing(t *testing.T) {
+	h := newHarness(t, withReport)
+
+	// Nothing has been reported yet, so the very first message says so even
+	// though there is nothing signed in and nothing unread.
+	h.step(t, tea.WindowSizeMsg{Width: 100, Height: 20})
+
+	gt.Equal(t, 1, len(h.reports))
+	gt.Equal(t, tui.ActivitySignedOut, h.reports[0].activity)
+	gt.Equal(t, 0, h.reports[0].unread)
+	gt.Equal(t, uint64(1), h.reports[0].seq)
+}
+
+func TestTheSameStateIsNotReportedTwice(t *testing.T) {
+	h := newHarness(t, withReport)
+	h.ready(t, sampleList()...)
+
+	// None of these change the phase or the unread count.
+	h.step(t, press('j'))
+	h.step(t, press('k'))
+	h.step(t, keyTab)
+	h.step(t, press('a'))
+	runCmd(t, h.send(t, h.m.PollResultMsg(&usecase.PollResult{
+		NotModified:  true,
+		NextInterval: time.Millisecond,
+	}, nil)))
+
+	gt.Equal(t, 0, len(h.reports))
+}
+
+func TestReportFollowsTheUnreadCount(t *testing.T) {
+	t.Run("marking one read", func(t *testing.T) {
+		h := newHarness(t, withReport)
+		h.ready(t, sampleList()...)
+
+		h.step(t, press('I'))
+
+		gt.Equal(t, 1, len(h.reports))
+		gt.Equal(t, tui.ActivityReady, h.reports[0].activity)
+		gt.Equal(t, 4, h.reports[0].unread)
+	})
+
+	t.Run("marking one unread again", func(t *testing.T) {
+		h := newHarness(t, withReport)
+		h.ready(t, sampleList()...)
+
+		// Read rows are hidden by default, so without this the row just marked
+		// read would leave the list and the next key would act on another one.
+		h.step(t, press('a'))
+		h.step(t, press('I'))
+		h.step(t, tea.KeyPressMsg{Code: 'U', Text: "U"})
+
+		gt.Equal(t, 2, len(h.reports))
+		gt.Equal(t, 4, h.reports[0].unread)
+		gt.Equal(t, 5, h.reports[1].unread)
+	})
+
+	t.Run("archiving an unread row", func(t *testing.T) {
+		// The archive job is allowed to finish here, because the commands it
+		// produces are run rather than only the events fed in by hand.
+		h := newHarness(t, withReport, withFastArchive)
+		h.ready(t, sampleList()...)
+
+		h.step(t, press('e'))
+		ch := h.m.ArchiveChannel()
+		h.step(t, tui.ArchiveEventMsg(ch, usecase.ArchiveEvent{Index: 0, Total: 1, ID: "1"}, true))
+
+		gt.True(t, len(h.reports) >= 1)
+		gt.Equal(t, 4, h.reports[len(h.reports)-1].unread)
+	})
+
+	t.Run("a poll that brings more unread", func(t *testing.T) {
+		h := newHarness(t, withReport)
+		h.ready(t, sampleList()...)
+
+		runCmd(t, h.poll(t, append(sampleList(), arrival("9", "acme/tools", 9))...))
+
+		gt.Equal(t, 1, len(h.reports))
+		gt.Equal(t, 6, h.reports[0].unread)
+	})
+}
+
+func TestASavedListIsReportedAsSoonAsItIsDrawn(t *testing.T) {
+	h := newHarness(t, withReport)
+	h.step(t, tea.WindowSizeMsg{Width: 100, Height: 20})
+	h.reports = nil
+
+	h.step(t, tui.RestoreMsgWithSnapshot(&model.PollSnapshot{
+		SavedAt:        fixedNow,
+		Notifications:  sampleList(),
+		ReviewRequests: model.ReviewRequests{},
+	}))
+
+	// Restoring moves the phase to loading and puts five unread rows on screen.
+	gt.Equal(t, 1, len(h.reports))
+	gt.Equal(t, tui.ActivityLoading, h.reports[0].activity)
+	gt.Equal(t, 5, h.reports[0].unread)
+}
+
+func TestARejectedTokenIsReportedAsSignedOut(t *testing.T) {
+	h := newHarness(t, withReport)
+	h.ready(t, sampleList()...)
+
+	rejected := model.WithUserMessage(gh.ErrUnauthorized, model.UserMessage{Summary: "GitHub rejected the saved token"})
+	h.step(t, h.m.PollResultMsg(&usecase.PollResult{NextInterval: time.Millisecond}, rejected))
+
+	gt.Equal(t, 1, len(h.reports))
+	gt.Equal(t, tui.ActivitySignedOut, h.reports[0].activity)
+	gt.Equal(t, 0, h.reports[0].unread)
+}
+
+func TestReportSequenceRisesByOne(t *testing.T) {
+	h := newHarness(t, withReport)
+	h.step(t, tea.WindowSizeMsg{Width: 100, Height: 20})
+	runCmd(t, h.poll(t, sampleList()...))
+	h.step(t, press('I'))
+
+	gt.Equal(t, 3, len(h.reports))
+	for i, r := range h.reports {
+		gt.Equal(t, uint64(i+1), r.seq)
+	}
+}
+
+func TestAFailedReportLeavesTheStatusLineAlone(t *testing.T) {
+	h := newHarness(t, withReport)
+	h.reportErr = goerr.New("no herdr server")
+	h.ready(t, sampleList()...)
+
+	before := h.m.Status()
+	h.step(t, press('I'))
+
+	gt.Equal(t, 1, len(h.reports))
+	gt.Equal(t, before, h.m.Status())
+}
+
+func TestAReportAToastAndTheNextPollAllSurviveOneUpdate(t *testing.T) {
+	h := newHarness(t, withAnnounce, withReport)
+	h.ready(t, sampleList()...)
+
+	// One poll that both brings something new and changes the count, so all
+	// three commands come out of the same update.
+	cmd := h.poll(t, append(sampleList(), arrival("9", "acme/tools", 9))...)
+	gt.True(t, cmd != nil).Required()
+	runCmd(t, cmd)
+
+	gt.Equal(t, 1, len(h.announced))
+	gt.Equal(t, 1, len(h.reports))
+	gt.Equal(t, 6, h.reports[0].unread)
+	gt.Equal(t, tui.PhaseReady, h.m.Phase())
+}
+
+func TestActivityFollowsThePhase(t *testing.T) {
+	h := newHarness(t, withReport)
+	gt.Equal(t, tui.ActivitySignedOut, h.m.CurrentActivity())
+
+	h.step(t, tea.WindowSizeMsg{Width: 100, Height: 20})
+	h.step(t, tui.DeviceCodeMsg(&gh.DeviceCode{
+		UserCode:        "ABCD-EFGH",
+		VerificationURI: "https://github.com/login/device",
+		Interval:        time.Second,
+		ExpiresAt:       fixedNow.Add(time.Minute),
+	}, nil))
+	gt.Equal(t, tui.ActivityAuthenticating, h.m.CurrentActivity())
+
+	h.step(t, tui.RestoreMsg(nil))
+	gt.Equal(t, tui.ActivityLoading, h.m.CurrentActivity())
+
+	runCmd(t, h.poll(t, sampleList()...))
+	gt.Equal(t, tui.ActivityReady, h.m.CurrentActivity())
 }
