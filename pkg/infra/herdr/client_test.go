@@ -72,6 +72,27 @@ func reply(conn net.Conn, line string) {
 	_, _ = io.WriteString(conn, line+"\n")
 }
 
+// TestLiveShow sends one toast to the herdr server this process is running
+// inside. Every other test here talks to a stand-in written against the same
+// assumptions octify's client makes, so this is the only check that the request
+// is one the real server accepts.
+//
+// It draws a toast on the developer's screen, so it is opt-in.
+func TestLiveShow(t *testing.T) {
+	if os.Getenv("TEST_HERDR_LIVE") == "" {
+		t.Skip("set TEST_HERDR_LIVE to send a toast to the running herdr server")
+	}
+
+	path, ok := herdr.Detect()
+	if !ok {
+		t.Fatal("TEST_HERDR_LIVE is set, but this process is not inside a herdr session")
+	}
+	t.Logf("socket: %s", path)
+
+	gt.NoError(t, herdr.New(path).Show(t.Context(),
+		"octify · m-mizutani/octify", "live check of the herdr bridge"))
+}
+
 func TestClientShowSendsTheRequest(t *testing.T) {
 	got := make(chan []byte, 1)
 	path := startServer(t, func(conn net.Conn, line []byte) {
