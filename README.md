@@ -156,6 +156,44 @@ over it.
 
 Press `?` for the same legend inside octify.
 
+## Desktop notifications inside herdr
+
+Run octify in a [herdr](https://herdr.dev) pane and a poll that finds something
+new shows a toast. Nothing has to be configured: octify sees `HERDR_ENV=1`,
+connects to the session's socket and asks herdr to draw it.
+
+Outside a herdr pane there is nothing to connect to, and octify never looks. The
+socket is not touched, no toast is composed, and a herdr that is not installed,
+not running or has toasts switched off changes nothing about the list — a
+failure to show one goes to the log and nowhere else.
+
+**One poll shows at most one toast.** A single new notification is announced by
+its repository and title; several are announced by their count, with the first
+one named.
+
+**The first poll of a session shows nothing.** It establishes what the next poll
+is compared against. Without that, a start after a few days away would announce
+the whole inbox as one arrival. The same happens after GitHub rejects the token:
+the first list you see after signing in again is a new starting point, not news.
+
+A notification is new when its thread was not in the previous poll's list, or
+when it was and has been updated since — which is how a new comment on a thread
+you are already watching arrives. Either way it is only announced if octify
+would draw it as unread, so what you have already read stays quiet, and a new
+comment on it does not, because an update supersedes the read record.
+
+**A toast carries the repository name and the title, private repositories
+included.** The socket it goes to is herdr's own, which only your user can
+connect to — but the toast itself is drawn over whatever is on screen, so it is
+visible while you are in another pane, sharing your screen or recording your
+terminal. `--no-herdr` turns it off.
+
+octify reads `HERDR_ENV`, `HERDR_SOCKET_PATH`, `HERDR_SESSION` and
+`XDG_CONFIG_HOME` to find the session. It writes nothing to them. Where the
+toast appears is herdr's `ui.toast` setting, which octify does not override.
+
+Turn it off with `--no-herdr`. Give it a sound with `--herdr-sound=done`.
+
 ## Configuration
 
 Every option is a flag with a matching environment variable. The flag wins.
@@ -176,6 +214,8 @@ Every option is a flag with a matching environment variable. The flag wins.
 | `--all` | `OCTIFY_ALL` | `false` | Start with read notifications shown |
 | `--max-pages` | `OCTIFY_MAX_PAGES` | `10` | Pages of 50 fetched per poll |
 | `--archive-gap` | `OCTIFY_ARCHIVE_GAP` | `1s` | Wait between bulk archive requests |
+| `--no-herdr` | `OCTIFY_NO_HERDR` | `false` | Never show a desktop notification |
+| `--herdr-sound` | `OCTIFY_HERDR_SOUND` | `none` | `none`, `done` or `request` |
 | `--log-level` | `OCTIFY_LOG_LEVEL` | `warn` | `debug`, `info`, `warn`, `error` |
 | `--log-file` | `OCTIFY_LOG_FILE` | — | Without it, logs are discarded |
 | `--log-format` | `OCTIFY_LOG_FORMAT` | `text` | `text` or `json` |

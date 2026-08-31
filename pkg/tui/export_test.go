@@ -33,6 +33,7 @@ func (m Model) Phase() Phase {
 }
 
 func (m Model) Polling() bool                { return m.polling }
+func (m Model) Baselined() bool              { return m.baselined }
 func (m Model) ShowingCache() bool           { return m.showingCache }
 func (m Model) Cursor() int                  { return m.cursor }
 func (m Model) Offset() int                  { return m.offset }
@@ -122,3 +123,7 @@ func ArchiveEventMsg(ch <-chan usecase.ArchiveEvent, ev usecase.ArchiveEvent, ok
 }
 
 func OpenResultMsg(err error) tea.Msg { return openResultMsg{err: err} }
+
+// AnnounceText exposes the toast composer so its wording can be checked without
+// driving a whole polling cycle.
+var AnnounceText = announceText

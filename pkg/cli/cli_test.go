@@ -200,6 +200,7 @@ func TestFlagValidation(t *testing.T) {
 		"negative archive gap": {[]string{"--archive-gap", "-1s"}, "--archive-gap must not be negative"},
 		"unknown log format":   {[]string{"--log-format", "yaml"}, "unknown log format"},
 		"unknown log level":    {[]string{"--log-level", "chatty"}, "unknown log level"},
+		"unknown herdr sound":  {[]string{"--herdr-sound", "chime"}, "unknown herdr sound"},
 	}
 
 	for name, tc := range testCases {
@@ -527,6 +528,55 @@ func hostOfTestServer(t *testing.T, serverURL string) string {
 	t.Helper()
 	u := gt.R1(url.Parse(serverURL)).NoError(t)
 	return u.Host
+}
+
+func TestDesktopNotificationsFollowTheHerdrEnvironment(t *testing.T) {
+	testCases := map[string]struct {
+		env  map[string]string
+		args []string
+		want bool
+	}{
+		"outside a herdr pane": {
+			env:  map[string]string{},
+			want: false,
+		},
+		"inside a herdr pane": {
+			env:  map[string]string{"HERDR_ENV": "1", "HERDR_SOCKET_PATH": "/run/herdr.sock"},
+			want: true,
+		},
+		"inside a herdr pane with --no-herdr": {
+			env:  map[string]string{"HERDR_ENV": "1", "HERDR_SOCKET_PATH": "/run/herdr.sock"},
+			args: []string{"--no-herdr"},
+			want: false,
+		},
+		"inside a herdr pane with OCTIFY_NO_HERDR": {
+			env: map[string]string{
+				"HERDR_ENV":         "1",
+				"HERDR_SOCKET_PATH": "/run/herdr.sock",
+				"OCTIFY_NO_HERDR":   "true",
+			},
+			want: false,
+		},
+		"inside a herdr pane with a sound chosen through the environment": {
+			env: map[string]string{
+				"HERDR_ENV":          "1",
+				"HERDR_SOCKET_PATH":  "/run/herdr.sock",
+				"OCTIFY_HERDR_SOUND": "done",
+			},
+			want: true,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			for _, key := range []string{"HERDR_ENV", "HERDR_SOCKET_PATH", "OCTIFY_NO_HERDR", "OCTIFY_HERDR_SOUND"} {
+				t.Setenv(key, tc.env[key])
+			}
+
+			got := gt.R1(cli.AnnounceForTest(t.Context(), append([]string{"octify"}, tc.args...))).NoError(t)
+			gt.Equal(t, tc.want, got)
+		})
+	}
 }
 
 func exchangeDeviceCode(t *testing.T, code string) error {

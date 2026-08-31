@@ -68,9 +68,20 @@ type harness struct {
 	uc      *usecase.UseCase
 	opened  []string
 	openErr error
+
+	// announcing decides whether the model is given somewhere to send toasts,
+	// which is what separates a run inside a herdr pane from every other run.
+	announcing  bool
+	announced   []toast
+	announceErr error
 }
 
-func newHarness(t *testing.T) *harness {
+type toast struct{ title, body string }
+
+// withAnnounce builds the harness as a run inside a herdr pane.
+func withAnnounce(h *harness) { h.announcing = true }
+
+func newHarness(t *testing.T, opts ...func(*harness)) *harness {
 	t.Helper()
 
 	// Archive requests hang until the context ends. That keeps a started job in
@@ -110,14 +121,26 @@ func newHarness(t *testing.T) *harness {
 	gt.NoError(t, restoreErr)
 
 	h := &harness{uc: uc}
-	h.m = tui.NewModel(t.Context(), uc, tui.Config{
+	for _, opt := range opts {
+		opt(h)
+	}
+
+	cfg := tui.Config{
 		WebBase: "https://github.com",
 		Now:     func() time.Time { return fixedNow },
 		OpenURL: func(ctx context.Context, url string) error {
 			h.opened = append(h.opened, url)
 			return h.openErr
 		},
-	})
+	}
+	if h.announcing {
+		cfg.Announce = func(ctx context.Context, title, body string) error {
+			h.announced = append(h.announced, toast{title: title, body: body})
+			return h.announceErr
+		}
+	}
+
+	h.m = tui.NewModel(t.Context(), uc, cfg)
 	return h
 }
 
@@ -1102,4 +1125,284 @@ func TestStaleResultLeavesTheRunningPollAlone(t *testing.T) {
 	h.send(t, stale)
 
 	gt.True(t, h.m.Polling())
+}
+
+// --- desktop notifications ---
+
+// poll drives one polling result through the model. The scheduling interval is
+// kept short so that the timer handlePollResult returns can be run in a test
+// without waiting out a real polling cycle.
+func (h *harness) poll(t *testing.T, ns ...model.Notification) tea.Cmd {
+	t.Helper()
+	return h.send(t, h.m.PollResultMsg(&usecase.PollResult{
+		Notifications:  ns,
+		ReviewRequests: model.ReviewRequests{},
+		NextInterval:   time.Millisecond,
+	}, nil))
+}
+
+// runCmd executes everything a polling result produced, following a batch into
+// the commands it holds. What the model announced is then read from the
+// harness rather than from the shape of the batch, which tea.Batch makes no
+// promise about. The scheduling timer is one of the commands run here, which is
+// why poll keeps the interval short.
+func runCmd(t *testing.T, cmd tea.Cmd) {
+	t.Helper()
+	if cmd == nil {
+		return
+	}
+	if batch, ok := cmd().(tea.BatchMsg); ok {
+		for _, c := range batch {
+			runCmd(t, c)
+		}
+	}
+}
+
+func arrival(id types.ThreadID, repo string, number int) model.Notification {
+	return notification(id, types.SubjectPullRequest, repo, number, true)
+}
+
+func TestNoAnnouncementWithoutSomewhereToSendOne(t *testing.T) {
+	h := newHarness(t)
+	h.resize(t, 100, 20)
+
+	h.poll(t, sampleList()...)
+	cmd := h.poll(t, append(sampleList(), arrival("9", "acme/tools", 9))...)
+
+	runCmd(t, cmd)
+	gt.Equal(t, 0, len(h.announced))
+}
+
+func TestFirstPollOfASessionAnnouncesNothing(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.resize(t, 100, 20)
+
+	gt.False(t, h.m.Baselined())
+	cmd := h.poll(t, sampleList()...)
+
+	runCmd(t, cmd)
+	gt.True(t, h.m.Baselined())
+}
+
+func TestOneArrivalIsAnnouncedWithItsRepositoryAndTitle(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.resize(t, 100, 20)
+
+	h.poll(t, sampleList()...)
+	cmd := h.poll(t, append(sampleList(), arrival("9", "acme/tools", 9))...)
+
+	runCmd(t, cmd)
+
+	gt.Equal(t, 1, len(h.announced))
+	gt.Equal(t, "octify · acme/tools", h.announced[0].title)
+	gt.Equal(t, "title of 9", h.announced[0].body)
+}
+
+func TestSeveralArrivalsAreAnnouncedAsOneToast(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.resize(t, 100, 20)
+
+	h.poll(t, sampleList()...)
+	cmd := h.poll(t, append(sampleList(),
+		arrival("7", "acme/tools", 7),
+		arrival("8", "acme/other", 8),
+		arrival("9", "acme/third", 9),
+	)...)
+
+	runCmd(t, cmd)
+
+	gt.Equal(t, 1, len(h.announced))
+	gt.Equal(t, "octify · 3 new notifications", h.announced[0].title)
+	gt.Equal(t, "acme/tools: title of 7 (+2 more)", h.announced[0].body)
+}
+
+func TestAPollWithNothingToAnnounceReturnsOnlyItsSchedule(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.resize(t, 100, 20)
+	h.poll(t, sampleList()...)
+
+	// Nothing new: the model must hand back the scheduling timer exactly as it
+	// did before announcements existed, not a batch wrapping it.
+	cmd := h.poll(t, sampleList()...)
+	gt.True(t, cmd != nil).Required()
+	if _, batched := cmd().(tea.BatchMsg); batched {
+		t.Error("expected only the poll schedule, got a batch")
+	}
+}
+
+func TestAnArrivalGitHubReportsAsReadIsNotAnnounced(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.resize(t, 100, 20)
+
+	h.poll(t, sampleList()...)
+	read := notification("9", types.SubjectPullRequest, "acme/tools", 9, false)
+	cmd := h.poll(t, append(sampleList(), read)...)
+
+	runCmd(t, cmd)
+	gt.Equal(t, 0, len(h.announced))
+}
+
+func TestAnArrivalReadInsideOctifyIsNotAnnounced(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.resize(t, 100, 20)
+	h.poll(t, sampleList()...)
+
+	// GitHub still reports it unread. The record the user made inside octify is
+	// what has to silence it.
+	fresh := arrival("9", "acme/tools", 9)
+	gt.NoError(t, h.uc.SetReadState(model.ReadStateRead, []model.Notification{fresh}))
+
+	cmd := h.poll(t, append(sampleList(), fresh)...)
+	runCmd(t, cmd)
+
+	gt.Equal(t, 0, len(h.announced))
+}
+
+func TestANewCommentOnAThreadReadInsideOctifyIsAnnounced(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.resize(t, 100, 20)
+
+	read := sampleList()[0]
+	gt.NoError(t, h.uc.SetReadState(model.ReadStateRead, []model.Notification{read}))
+	h.poll(t, sampleList()...)
+
+	// The record was written against the old timestamp, so an update supersedes
+	// it and the thread counts as unread again.
+	updated := sampleList()
+	updated[0].UpdatedAt = fixedNow
+	cmd := h.poll(t, updated...)
+	runCmd(t, cmd)
+
+	gt.Equal(t, 1, len(h.announced))
+	gt.Equal(t, "octify · acme/tools", h.announced[0].title)
+	gt.Equal(t, "title of 1", h.announced[0].body)
+}
+
+func TestAnUpdatedThreadIsAnnouncedAgain(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.resize(t, 100, 20)
+
+	h.poll(t, sampleList()...)
+
+	// A new comment does not add a row; it moves the thread's timestamp.
+	updated := sampleList()
+	updated[0].UpdatedAt = fixedNow
+	cmd := h.poll(t, updated...)
+
+	runCmd(t, cmd)
+
+	gt.Equal(t, 1, len(h.announced))
+	gt.Equal(t, "octify · acme/tools", h.announced[0].title)
+	gt.Equal(t, "title of 1", h.announced[0].body)
+}
+
+func TestANotModifiedPollAnnouncesNothing(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.resize(t, 100, 20)
+	h.poll(t, sampleList()...)
+
+	cmd := h.send(t, h.m.PollResultMsg(&usecase.PollResult{
+		NotModified:  true,
+		NextInterval: time.Millisecond,
+	}, nil))
+
+	runCmd(t, cmd)
+	gt.Equal(t, 0, len(h.announced))
+}
+
+func TestAFailedPollAnnouncesNothingAndKeepsTheBaseline(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.resize(t, 100, 20)
+	h.poll(t, sampleList()...)
+
+	failure := model.WithUserMessage(goerr.New("boom"), model.UserMessage{Summary: "GitHub is unreachable"})
+	cmd := h.send(t, h.m.PollResultMsg(&usecase.PollResult{NextInterval: time.Millisecond}, failure))
+
+	runCmd(t, cmd)
+	gt.True(t, h.m.Baselined())
+	gt.Equal(t, 0, len(h.announced))
+}
+
+func TestAFailedAnnouncementLeavesTheStatusLineAlone(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.announceErr = goerr.New("no herdr server")
+	h.resize(t, 100, 20)
+
+	h.poll(t, sampleList()...)
+	cmd := h.poll(t, append(sampleList(), arrival("9", "acme/tools", 9))...)
+
+	before := h.m.Status()
+	runCmd(t, cmd)
+
+	gt.Equal(t, before, h.m.Status())
+}
+
+func TestARejectedTokenResetsTheBaseline(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.resize(t, 100, 20)
+	h.poll(t, sampleList()...)
+
+	rejected := model.WithUserMessage(gh.ErrUnauthorized, model.UserMessage{Summary: "GitHub rejected the saved token"})
+	h.send(t, h.m.PollResultMsg(&usecase.PollResult{NextInterval: time.Millisecond}, rejected))
+	gt.False(t, h.m.Baselined())
+
+	// The first list after signing in again is a fresh basis, not an inbox to
+	// announce.
+	cmd := h.poll(t, sampleList()...)
+	runCmd(t, cmd)
+	gt.Equal(t, 0, len(h.announced))
+}
+
+func TestAFatalArchiveFailureResetsTheBaseline(t *testing.T) {
+	h := newHarness(t, withAnnounce)
+	h.resize(t, 100, 20)
+	h.poll(t, sampleList()...)
+	gt.True(t, h.m.Baselined())
+
+	h.send(t, press('e'))
+	ch := h.m.ArchiveChannel()
+
+	err := model.WithUserMessage(gh.ErrUnauthorized, model.UserMessage{Summary: "GitHub rejected the saved token"})
+	h.send(t, tui.ArchiveEventMsg(ch, usecase.ArchiveEvent{Index: 0, Total: 1, ID: "1", Err: err, Fatal: true}, true))
+
+	gt.False(t, h.m.Baselined())
+}
+
+func TestAnnounceText(t *testing.T) {
+	one := func(repo, subject string) model.Notification {
+		return model.Notification{
+			Repo:    model.Repository{FullName: types.RepoFullName(repo)},
+			Subject: model.Subject{Title: subject},
+		}
+	}
+
+	t.Run("a single arrival names its repository", func(t *testing.T) {
+		title, body := tui.AnnounceText([]model.Notification{one("acme/tools", "Fix the parser")})
+		gt.Equal(t, "octify · acme/tools", title)
+		gt.Equal(t, "Fix the parser", body)
+	})
+
+	t.Run("a single arrival without a repository name still has a title", func(t *testing.T) {
+		title, body := tui.AnnounceText([]model.Notification{one("", "Fix the parser")})
+		gt.Equal(t, "octify", title)
+		gt.Equal(t, "Fix the parser", body)
+	})
+
+	t.Run("several arrivals are counted", func(t *testing.T) {
+		title, body := tui.AnnounceText([]model.Notification{
+			one("acme/tools", "Fix the parser"),
+			one("acme/other", "Bump the runtime"),
+		})
+		gt.Equal(t, "octify · 2 new notifications", title)
+		gt.Equal(t, "acme/tools: Fix the parser (+1 more)", body)
+	})
+
+	t.Run("several arrivals where the first has no repository name", func(t *testing.T) {
+		title, body := tui.AnnounceText([]model.Notification{
+			one("", "Fix the parser"),
+			one("acme/other", "Bump the runtime"),
+		})
+		gt.Equal(t, "octify · 2 new notifications", title)
+		gt.Equal(t, "Fix the parser (+1 more)", body)
+	})
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/m-mizutani/goerr/v2"
 	"github.com/m-mizutani/octify/pkg/domain/model"
 	"github.com/m-mizutani/octify/pkg/infra/gh"
+	"github.com/m-mizutani/octify/pkg/infra/herdr"
 	"github.com/m-mizutani/octify/pkg/infra/pollcache"
 	"github.com/m-mizutani/octify/pkg/infra/readstate"
 	"github.com/m-mizutani/octify/pkg/infra/tokenstore"
@@ -61,6 +62,8 @@ type options struct {
 	all            bool
 	maxPages       int
 	archiveGap     time.Duration
+	noHerdr        bool
+	herdrSound     string
 	logLevel       string
 	logFile        string
 	logFormat      string
@@ -194,6 +197,19 @@ func (o *options) flags() []ucli.Flag {
 			Sources:     ucli.EnvVars("OCTIFY_ARCHIVE_GAP"),
 			Destination: &o.archiveGap,
 		},
+		&ucli.BoolFlag{
+			Name:        "no-herdr",
+			Usage:       "never show a desktop notification, even when running inside a herdr pane",
+			Sources:     ucli.EnvVars("OCTIFY_NO_HERDR"),
+			Destination: &o.noHerdr,
+		},
+		&ucli.StringFlag{
+			Name:        "herdr-sound",
+			Usage:       "sound herdr plays with the notification: none, done or request",
+			Value:       string(herdr.SoundNone),
+			Sources:     ucli.EnvVars("OCTIFY_HERDR_SOUND"),
+			Destination: &o.herdrSound,
+		},
 		&ucli.StringFlag{
 			Name:        "log-level",
 			Usage:       "debug, info, warn or error",
@@ -258,6 +274,12 @@ func (o *options) validate() error {
 			goerr.New("archive gap is negative", goerr.V("archive_gap", o.archiveGap.String())),
 			model.UserMessage{Summary: "--archive-gap must not be negative"},
 		)
+	}
+	if err := herdr.Sound(o.herdrSound).Validate(); err != nil {
+		return model.WithUserMessage(err, model.UserMessage{
+			Summary: "unknown herdr sound",
+			Action:  "use none, done or request",
+		})
 	}
 	if err := logging.Format(o.logFormat).Validate(); err != nil {
 		return model.WithUserMessage(err, model.UserMessage{
@@ -456,5 +478,22 @@ func runTUI(ctx context.Context, opt *options) error {
 		WebBase:  opt.webBase,
 		OpenURL:  browser.Open,
 		ShowRead: opt.all,
+		Announce: opt.announceFunc(),
 	})
+}
+
+// announceFunc returns the toast sender for this run, or nil when there is
+// nowhere to send one.
+//
+// Whether octify has a desktop notification to reach for is decided here and
+// nowhere else, so nothing below this boundary has to know that herdr exists.
+func (o *options) announceFunc() func(ctx context.Context, title, body string) error {
+	if o.noHerdr {
+		return nil
+	}
+	socket, ok := herdr.Detect()
+	if !ok {
+		return nil
+	}
+	return herdr.New(socket, herdr.WithSound(herdr.Sound(o.herdrSound))).Show
 }
