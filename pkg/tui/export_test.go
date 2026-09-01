@@ -34,6 +34,7 @@ func (m Model) Phase() Phase {
 
 func (m Model) Polling() bool                { return m.polling }
 func (m Model) Baselined() bool              { return m.baselined }
+func (m Model) CurrentActivity() Activity    { return m.activity() }
 func (m Model) ShowingCache() bool           { return m.showingCache }
 func (m Model) Cursor() int                  { return m.cursor }
 func (m Model) Offset() int                  { return m.offset }

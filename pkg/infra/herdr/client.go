@@ -22,6 +22,8 @@ var (
 	ErrRequestFailed = goerr.New("herdr: the server refused the request")
 	// ErrNoResponse is the server closing the connection without a line.
 	ErrNoResponse = goerr.New("herdr: the server closed without answering")
+	// ErrNoPane is a report attempted for a session that named no pane.
+	ErrNoPane = goerr.New("herdr: no pane id in this session")
 )
 
 // Client sends toasts to one herdr session.
@@ -33,7 +35,7 @@ var (
 //
 // The zero value is not usable; call New.
 type Client struct {
-	path    string
+	sess    Session
 	sound   Sound
 	timeout time.Duration
 	dial    func(ctx context.Context, path string) (net.Conn, error)
@@ -73,9 +75,9 @@ func WithDialer(fn func(ctx context.Context, path string) (net.Conn, error)) Opt
 	}
 }
 
-func New(socketPath string, opts ...Option) *Client {
+func New(sess Session, opts ...Option) *Client {
 	c := &Client{
-		path:    socketPath,
+		sess:    sess,
 		sound:   SoundNone,
 		timeout: defaultTimeout,
 		dial:    dialUnix,
@@ -85,6 +87,10 @@ func New(socketPath string, opts ...Option) *Client {
 	}
 	return c
 }
+
+// CanReport reports whether this session named a pane to report for. Toasts
+// work without one; reports do not.
+func (c *Client) CanReport() bool { return c.sess.PaneID != "" }
 
 func dialUnix(ctx context.Context, path string) (net.Conn, error) {
 	var d net.Dialer
@@ -97,14 +103,97 @@ func dialUnix(ctx context.Context, path string) (net.Conn, error) {
 // rate limit was hit, or no client is in the foreground — is not an error. Only
 // a failure to ask is.
 func (c *Client) Show(ctx context.Context, title, body string) error {
+	resp, err := c.call(ctx, methodNotificationShow, showParams{
+		Title: sanitize(title, maxTitleRunes),
+		Body:  sanitize(body, maxBodyRunes),
+		Sound: c.sound,
+	})
+	if err != nil {
+		return err
+	}
+
+	// The reason is the only result octify reads, and only to record in the log
+	// why a toast the server accepted never reached the screen. A result that
+	// cannot be read at all is still a failure to ask, because nothing then says
+	// the toast was accepted.
+	var result showResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return goerr.Wrap(err, "failed to decode the notification.show result")
+	}
+	if !result.Shown {
+		logging.From(ctx).Debug("herdr did not draw the notification",
+			slog.String("reason", result.Reason))
+	}
+	return nil
+}
+
+// Report tells herdr that this pane holds octify, in what state, and what to
+// show beside it.
+//
+// seq orders reports against each other. They are sent concurrently and may
+// arrive out of order, and the order that matters is the one the caller
+// produced them in rather than the one they reach the socket in.
+//
+// The state is sent first and the title second, so a state the server refuses
+// stops the call before a title describes a state that was never accepted.
+func (c *Client) Report(ctx context.Context, seq uint64, state State, title string) error {
+	if err := state.Validate(); err != nil {
+		return err
+	}
+	if c.sess.PaneID == "" {
+		return goerr.Wrap(ErrNoPane, "cannot report an agent")
+	}
+
+	if _, err := c.call(ctx, methodPaneReportAgent, reportAgentParams{
+		PaneID: c.sess.PaneID,
+		Source: reportSource,
+		Agent:  agentLabel,
+		State:  state,
+		Seq:    seq,
+	}); err != nil {
+		return err
+	}
+
+	_, err := c.call(ctx, methodPaneReportMetadata, reportMetadataParams{
+		PaneID: c.sess.PaneID,
+		Source: reportSource,
+		Agent:  agentLabel,
+		Title:  sanitize(title, maxTitleRunes),
+		Seq:    seq,
+	})
+	return err
+}
+
+// Release withdraws the report so the pane stops being listed as octify.
+//
+// herdr cannot notice on its own that the process which reported an agent has
+// gone: the report arrives over a connection that closes immediately after it,
+// and nothing in it identifies a process. Withdrawing is the only way the entry
+// leaves the list short of the pane itself closing.
+//
+// seq must be higher than every seq already reported, so that a report the
+// server has not applied yet cannot outrank the withdrawal and put a finished
+// octify back in the list.
+func (c *Client) Release(ctx context.Context, seq uint64) error {
+	if c.sess.PaneID == "" {
+		return goerr.Wrap(ErrNoPane, "cannot release an agent")
+	}
+
+	_, err := c.call(ctx, methodPaneReleaseAgent, releaseAgentParams{
+		PaneID: c.sess.PaneID,
+		Source: reportSource,
+		Agent:  agentLabel,
+		Seq:    seq,
+	})
+	return err
+}
+
+// call sends one request and reads the single line that answers it.
+func (c *Client) call(ctx context.Context, method string, params any) (*response, error) {
 	req := request{
 		ID:     "octify-" + strconv.FormatUint(c.seq.Add(1), 10),
-		Method: methodNotificationShow,
-		Params: showParams{
-			Title: sanitize(title, maxTitleRunes),
-			Body:  sanitize(body, maxBodyRunes),
-			Sound: c.sound,
-		},
+		Method: method,
+		Params: params,
 	}
 
 	// The effective deadline is the earlier of this client's own and any the
@@ -112,15 +201,15 @@ func (c *Client) Show(ctx context.Context, title, body string) error {
 	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	conn, err := c.dial(reqCtx, c.path)
+	conn, err := c.dial(reqCtx, c.sess.Socket)
 	if err != nil {
-		return goerr.Wrap(err, "failed to dial the herdr socket", goerr.V("path", c.path))
+		return nil, goerr.Wrap(err, "failed to dial the herdr socket", goerr.V("path", c.sess.Socket))
 	}
 	defer safe.Close(ctx, conn)
 
 	if deadline, ok := reqCtx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
-			return goerr.Wrap(err, "failed to set the herdr socket deadline")
+			return nil, goerr.Wrap(err, "failed to set the herdr socket deadline")
 		}
 	}
 
@@ -135,25 +224,22 @@ func (c *Client) Show(ctx context.Context, title, body string) error {
 	// Encode writes a trailing newline, which is exactly the framing the server
 	// expects.
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return goerr.Wrap(err, "failed to send the herdr request", goerr.V("request_id", req.ID))
+		return nil, goerr.Wrap(err, "failed to send the herdr request",
+			goerr.V("method", method), goerr.V("request_id", req.ID))
 	}
 
 	resp, err := readResponse(conn)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if resp.Error != nil {
-		return goerr.Wrap(ErrRequestFailed, "herdr refused notification.show",
+		return nil, goerr.Wrap(ErrRequestFailed, "herdr refused the request",
+			goerr.V("method", method),
 			goerr.V("request_id", req.ID),
 			goerr.V("code", resp.Error.Code),
 			goerr.V("message", resp.Error.Message))
 	}
-
-	if resp.Result != nil && !resp.Result.Shown {
-		logging.From(ctx).Debug("herdr did not draw the notification",
-			slog.String("request_id", req.ID), slog.String("reason", resp.Result.Reason))
-	}
-	return nil
+	return resp, nil
 }
 
 func readResponse(conn net.Conn) (*response, error) {

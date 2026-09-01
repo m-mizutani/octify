@@ -33,7 +33,24 @@ type Config struct {
 	// whole of how this program behaves without herdr: nothing downstream of
 	// here looks for one.
 	Announce func(ctx context.Context, title, body string) error
+	// Report tells the workspace what octify is doing and how much is waiting.
+	// It is nil when there is nowhere to report to. seq rises by one per report
+	// and orders them against each other.
+	Report func(ctx context.Context, seq uint64, activity Activity, unread int) error
 }
+
+// Activity is what octify is doing, in the terms the workspace needs. It is
+// deliberately octify's own vocabulary: translating it into whatever the
+// workspace calls these states is the caller's job, so nothing in here has to
+// know which workspace it is talking to.
+type Activity string
+
+const (
+	ActivitySignedOut      Activity = "signed out"
+	ActivityAuthenticating Activity = "authenticating"
+	ActivityLoading        Activity = "loading"
+	ActivityReady          Activity = "ready"
+)
 
 type phase int
 
@@ -107,6 +124,14 @@ type Model struct {
 	// whatever a previous run saved, and a few days away turns the whole inbox
 	// into one toast.
 	baselined bool
+
+	// reported records what the workspace was last told, so the same thing is
+	// not said twice. reported is false until the first report, which is why an
+	// unset reportedActivity is never mistaken for a match.
+	reported         bool
+	reportedActivity Activity
+	reportedUnread   int
+	reportSeq        uint64
 
 	archive *archiveState
 	status  model.UserMessage
@@ -195,7 +220,68 @@ func (m Model) Init() tea.Cmd {
 	}
 }
 
+// Update handles one message and then, in one place, decides whether the
+// workspace needs to be told something new.
+//
+// The unread count moves for four different reasons — a poll, a saved list, a
+// read/unread key, an archived row — and raising the report from each of them
+// would mean a fifth reason could be added without one. Deciding here instead
+// means the report cannot be forgotten.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+
+	updated, ok := next.(Model)
+	if !ok {
+		return next, cmd
+	}
+	report := updated.reportCmd()
+
+	// tea.Batch drops a nil command and returns a lone survivor as it is, so an
+	// update with nothing to report returns exactly what it returned before.
+	return updated, tea.Batch(cmd, report)
+}
+
+// reportCmd returns a report when what it would say differs from the last one
+// sent, and nil when it would repeat itself or when there is nowhere to send it.
+func (m *Model) reportCmd() tea.Cmd {
+	if m.cfg.Report == nil {
+		return nil
+	}
+
+	activity, unread := m.activity(), m.unreadCount()
+	if m.reported && m.reportedActivity == activity && m.reportedUnread == unread {
+		return nil
+	}
+
+	m.reported = true
+	m.reportedActivity, m.reportedUnread = activity, unread
+	m.reportSeq++
+
+	report, ctx, seq := m.cfg.Report, m.ctx, m.reportSeq
+	return func() tea.Msg {
+		if err := report(ctx, seq, activity, unread); err != nil {
+			logging.From(ctx).Warn("could not report to herdr", slog.Any("error", err))
+		}
+		return nil
+	}
+}
+
+// activity names what octify is doing, which is the screen phase seen from
+// outside the program.
+func (m Model) activity() Activity {
+	switch m.phase {
+	case phaseUnauthenticated:
+		return ActivitySignedOut
+	case phaseAuthenticating:
+		return ActivityAuthenticating
+	case phaseLoading:
+		return ActivityLoading
+	default:
+		return ActivityReady
+	}
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height

@@ -1,7 +1,12 @@
 package cli_test
 
 import (
+	"bufio"
 	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,9 +22,11 @@ import (
 	"github.com/m-mizutani/octify/pkg/domain/model"
 	"github.com/m-mizutani/octify/pkg/domain/types"
 	"github.com/m-mizutani/octify/pkg/infra/gh"
+	"github.com/m-mizutani/octify/pkg/infra/herdr"
 	"github.com/m-mizutani/octify/pkg/infra/pollcache"
 	"github.com/m-mizutani/octify/pkg/infra/readstate"
 	"github.com/m-mizutani/octify/pkg/infra/tokenstore"
+	"github.com/m-mizutani/octify/pkg/tui"
 )
 
 // env points every path and endpoint at test-owned locations so no command
@@ -577,6 +584,264 @@ func TestDesktopNotificationsFollowTheHerdrEnvironment(t *testing.T) {
 			gt.Equal(t, tc.want, got)
 		})
 	}
+}
+
+func TestReportingFollowsTheHerdrEnvironment(t *testing.T) {
+	testCases := map[string]struct {
+		env        map[string]string
+		args       []string
+		wantReport bool
+		wantToast  bool
+	}{
+		"outside a herdr pane": {
+			env: map[string]string{},
+		},
+		"inside a herdr pane with a pane id": {
+			env: map[string]string{
+				"HERDR_ENV":         "1",
+				"HERDR_SOCKET_PATH": "/run/herdr.sock",
+				"HERDR_PANE_ID":     "w1:p1",
+			},
+			wantReport: true,
+			wantToast:  true,
+		},
+		"inside a herdr session that named no pane": {
+			env: map[string]string{
+				"HERDR_ENV":         "1",
+				"HERDR_SOCKET_PATH": "/run/herdr.sock",
+			},
+			// A toast is addressed to the session, a report to a pane.
+			wantReport: false,
+			wantToast:  true,
+		},
+		"inside a herdr pane with --no-herdr": {
+			env: map[string]string{
+				"HERDR_ENV":         "1",
+				"HERDR_SOCKET_PATH": "/run/herdr.sock",
+				"HERDR_PANE_ID":     "w1:p1",
+			},
+			args: []string{"--no-herdr"},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			for _, key := range []string{"HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_PANE_ID", "OCTIFY_NO_HERDR"} {
+				t.Setenv(key, tc.env[key])
+			}
+			argv := append([]string{"octify"}, tc.args...)
+
+			link := gt.R1(cli.LinkForTest(t.Context(), argv)).NoError(t)
+			gt.Equal(t, tc.wantReport, link.Report != nil)
+			gt.Equal(t, tc.wantToast, link.Toast != nil)
+		})
+	}
+}
+
+func TestHerdrStatus(t *testing.T) {
+	testCases := map[string]struct {
+		activity  tui.Activity
+		unread    int
+		wantState herdr.State
+		wantTitle string
+	}{
+		"signed out": {
+			activity:  tui.ActivitySignedOut,
+			wantState: herdr.StateIdle,
+			wantTitle: "not signed in",
+		},
+		"waiting for the user to enter the device code": {
+			activity:  tui.ActivityAuthenticating,
+			wantState: herdr.StateBlocked,
+			wantTitle: "waiting for the device code",
+		},
+		"waiting for the first list": {
+			activity:  tui.ActivityLoading,
+			wantState: herdr.StateWorking,
+			wantTitle: "loading",
+		},
+		"nothing unread": {
+			activity:  tui.ActivityReady,
+			unread:    0,
+			wantState: herdr.StateIdle,
+			wantTitle: "0 unread",
+		},
+		"one unread keeps the plural": {
+			activity:  tui.ActivityReady,
+			unread:    1,
+			wantState: herdr.StateBlocked,
+			wantTitle: "1 unread",
+		},
+		"several unread": {
+			activity:  tui.ActivityReady,
+			unread:    12,
+			wantState: herdr.StateBlocked,
+			wantTitle: "12 unread",
+		},
+		"an activity this build does not know": {
+			activity:  tui.Activity("napping"),
+			wantState: herdr.StateUnknown,
+			wantTitle: "octify",
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			state, title := cli.HerdrStatus(tc.activity, tc.unread)
+			gt.Equal(t, tc.wantState, state)
+			gt.Equal(t, tc.wantTitle, title)
+
+			// Whatever the translation produces has to be something herdr will
+			// take.
+			gt.NoError(t, state.Validate())
+		})
+	}
+}
+
+func TestReleaseIsSentEvenWhenTheContextIsDone(t *testing.T) {
+	lines := make(chan []byte, 4)
+	socket := startHerdrStub(t, lines, nil)
+
+	t.Setenv("HERDR_ENV", "1")
+	t.Setenv("HERDR_SOCKET_PATH", socket)
+	t.Setenv("HERDR_PANE_ID", "w1:p1")
+
+	link := gt.R1(cli.LinkForTest(t.Context(), []string{"octify"})).NoError(t)
+
+	// ctrl+c is how most people leave octify, so the context is already done by
+	// the time the withdrawal is sent.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	link.Release(ctx)
+
+	method, _ := decodeLine(t, <-lines)
+	gt.Equal(t, "pane.release_agent", method)
+}
+
+func TestTheWithdrawalOutranksEveryReport(t *testing.T) {
+	lines := make(chan []byte, 8)
+	socket := startHerdrStub(t, lines, nil)
+
+	t.Setenv("HERDR_ENV", "1")
+	t.Setenv("HERDR_SOCKET_PATH", socket)
+	t.Setenv("HERDR_PANE_ID", "w1:p1")
+
+	link := gt.R1(cli.LinkForTest(t.Context(), []string{"octify"})).NoError(t)
+	gt.NoError(t, link.Report(t.Context(), 1, tui.ActivityReady, 3))
+	gt.NoError(t, link.Report(t.Context(), 2, tui.ActivityReady, 0))
+	link.Release(t.Context())
+
+	// Two reports of two requests each, then the withdrawal.
+	var last map[string]any
+	for range 5 {
+		_, last = decodeLine(t, <-lines)
+	}
+
+	// A report the server has not applied yet must not be able to outrank the
+	// withdrawal and put a finished octify back in the list.
+	gt.True(t, gt.Cast[float64](t, last["seq"]) > 2)
+}
+
+func TestTheWithdrawalWaitsForAReportAlreadyUnderWay(t *testing.T) {
+	lines := make(chan []byte, 8)
+	gate := make(chan struct{})
+	socket := startHerdrStub(t, lines, gate)
+
+	t.Setenv("HERDR_ENV", "1")
+	t.Setenv("HERDR_SOCKET_PATH", socket)
+	t.Setenv("HERDR_PANE_ID", "w1:p1")
+
+	link := gt.R1(cli.LinkForTest(t.Context(), []string{"octify"})).NoError(t)
+
+	reported := make(chan error, 1)
+	go func() { reported <- link.Report(t.Context(), 1, tui.ActivityReady, 3) }()
+
+	// The state has reached the server and is being held there, so the report is
+	// unambiguously under way before the withdrawal is asked for.
+	method, _ := decodeLine(t, <-lines)
+	gt.Equal(t, "pane.report_agent", method)
+
+	released := make(chan struct{})
+	go func() { defer close(released); link.Release(t.Context()) }()
+
+	close(gate)
+	gt.NoError(t, <-reported)
+	<-released
+
+	// Bubble Tea abandons command goroutines when the program ends, so without
+	// the wait the withdrawal could reach the server first and be undone by the
+	// rest of the report.
+	method, _ = decodeLine(t, <-lines)
+	gt.Equal(t, "pane.report_metadata", method)
+	method, _ = decodeLine(t, <-lines)
+	gt.Equal(t, "pane.release_agent", method)
+}
+
+func TestNothingIsReleasedOutsideHerdr(t *testing.T) {
+	lines := make(chan []byte, 1)
+	socket := startHerdrStub(t, lines, nil)
+
+	t.Setenv("HERDR_ENV", "")
+	t.Setenv("HERDR_SOCKET_PATH", socket)
+	t.Setenv("HERDR_PANE_ID", "")
+
+	link := gt.R1(cli.LinkForTest(t.Context(), []string{"octify"})).NoError(t)
+	gt.True(t, link.Report == nil)
+	link.Release(t.Context())
+
+	gt.Equal(t, 0, len(lines))
+}
+
+func decodeLine(t *testing.T, line []byte) (method string, params map[string]any) {
+	t.Helper()
+
+	var sent map[string]any
+	gt.NoError(t, json.Unmarshal(line, &sent)).Required()
+	return gt.Cast[string](t, sent["method"]), gt.Cast[map[string]any](t, sent["params"])
+}
+
+// startHerdrStub answers every request with a bare success and keeps the lines
+// it was sent. When hold is non-nil, the first pane.report_agent is answered
+// only once that channel is closed, which lets a test pin a report as under way.
+func startHerdrStub(t *testing.T, lines chan<- []byte, hold <-chan struct{}) string {
+	t.Helper()
+
+	// Kept short so the socket path stays inside what a sockaddr_un can hold.
+	dir := gt.R1(os.MkdirTemp("", "oct")).NoError(t)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	path := filepath.Join(dir, "h.sock")
+	ln := gt.R1(net.Listen("unix", path)).NoError(t)
+
+	done := make(chan struct{})
+	t.Cleanup(func() { <-done })
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				sc := bufio.NewScanner(conn)
+				if !sc.Scan() {
+					return
+				}
+				line := append([]byte(nil), sc.Bytes()...)
+				lines <- line
+
+				if hold != nil && strings.Contains(string(line), "pane.report_agent") {
+					<-hold
+				}
+				_, _ = io.WriteString(conn, `{"id":"octify-1","result":{"type":"ok"}}`+"\n")
+			}()
+		}
+	}()
+
+	return path
 }
 
 func exchangeDeviceCode(t *testing.T, code string) error {

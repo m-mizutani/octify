@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/m-mizutani/octify/pkg/tui"
 	"github.com/m-mizutani/octify/pkg/usecase"
 	ucli "github.com/urfave/cli/v3"
 )
@@ -38,7 +39,7 @@ func AnnounceForTest(ctx context.Context, argv []string) (bool, error) {
 		Name:  "octify",
 		Flags: opt.flags(),
 		Action: func(context.Context, *ucli.Command) error {
-			got = opt.announceFunc() != nil
+			got = opt.herdrLink().announceFunc() != nil
 			return nil
 		},
 	}
@@ -47,6 +48,44 @@ func AnnounceForTest(ctx context.Context, argv []string) (bool, error) {
 	}
 	return got, nil
 }
+
+// Link is one run's connection to the workspace, as runTUI builds it. The
+// reporter and the withdrawal share it, which is what makes them ordered
+// against each other.
+type Link struct {
+	Report  func(ctx context.Context, seq uint64, activity tui.Activity, unread int) error
+	Release func(ctx context.Context)
+	Toast   func(ctx context.Context, title, body string) error
+}
+
+// LinkForTest builds the workspace link for the given argv in the environment
+// the test has set up.
+func LinkForTest(ctx context.Context, argv []string) (Link, error) {
+	var opt options
+	var got Link
+
+	cmd := &ucli.Command{
+		Name:  "octify",
+		Flags: opt.flags(),
+		Action: func(context.Context, *ucli.Command) error {
+			link := opt.herdrLink()
+			got = Link{
+				Report:  link.reportFunc(),
+				Release: link.release,
+				Toast:   link.announceFunc(),
+			}
+			return nil
+		},
+	}
+	if err := cmd.Run(ctx, argv); err != nil {
+		return Link{}, err
+	}
+	return got, nil
+}
+
+// HerdrStatus exposes the translation from what octify is doing into what herdr
+// shows beside the pane.
+var HerdrStatus = herdrStatus
 
 // Paths reports where the three files land for the given argv, which is the
 // other half of what the flags decide.

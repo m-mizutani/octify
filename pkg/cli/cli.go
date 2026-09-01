@@ -8,6 +8,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/m-mizutani/goerr/v2"
@@ -199,7 +202,7 @@ func (o *options) flags() []ucli.Flag {
 		},
 		&ucli.BoolFlag{
 			Name:        "no-herdr",
-			Usage:       "never show a desktop notification, even when running inside a herdr pane",
+			Usage:       "never reach herdr, even when running inside one of its panes: no desktop notification and no entry in its agent list",
 			Sources:     ucli.EnvVars("OCTIFY_NO_HERDR"),
 			Destination: &o.noHerdr,
 		},
@@ -474,26 +477,138 @@ func runTUI(ctx context.Context, opt *options) error {
 		})
 	}
 
-	return tui.Run(ctx, uc, tui.Config{
+	link := opt.herdrLink()
+
+	err = tui.Run(ctx, uc, tui.Config{
 		WebBase:  opt.webBase,
 		OpenURL:  browser.Open,
 		ShowRead: opt.all,
-		Announce: opt.announceFunc(),
+		Announce: link.announceFunc(),
+		Report:   link.reportFunc(),
 	})
+
+	// The pane stops being octify's the moment the program ends.
+	link.release(ctx)
+	return err
+}
+
+// herdrLink is one run's connection to the workspace.
+//
+// It is built once and shared, because the withdrawal at the end has to know
+// what the reports before it did: Bubble Tea abandons command goroutines when
+// the program ends rather than waiting for them, so a report can still be on
+// the socket when octify is already leaving.
+//
+// A nil link is a run with no workspace to talk to, and every method here
+// accepts one.
+type herdrLink struct {
+	client *herdr.Client
+	// inFlight counts reports that have begun and not yet finished. The
+	// withdrawal waits for them, which is bounded because every report carries
+	// the client's own deadline.
+	inFlight sync.WaitGroup
+	// seq is the highest report number handed to the server, so the withdrawal
+	// can be numbered above anything the server has not applied yet.
+	seq atomic.Uint64
+}
+
+// herdrLink returns this run's link to the workspace, or nil when there is none
+// to talk to.
+//
+// Whether octify has a workspace to reach for is decided here and nowhere else,
+// so nothing below this boundary has to know that herdr exists.
+func (o *options) herdrLink() *herdrLink {
+	if o.noHerdr {
+		return nil
+	}
+	sess, ok := herdr.Detect()
+	if !ok {
+		return nil
+	}
+	return &herdrLink{client: herdr.New(sess, herdr.WithSound(herdr.Sound(o.herdrSound)))}
 }
 
 // announceFunc returns the toast sender for this run, or nil when there is
 // nowhere to send one.
-//
-// Whether octify has a desktop notification to reach for is decided here and
-// nowhere else, so nothing below this boundary has to know that herdr exists.
-func (o *options) announceFunc() func(ctx context.Context, title, body string) error {
-	if o.noHerdr {
+func (l *herdrLink) announceFunc() func(ctx context.Context, title, body string) error {
+	if l == nil {
 		return nil
 	}
-	socket, ok := herdr.Detect()
-	if !ok {
-		return nil
-	}
-	return herdr.New(socket, herdr.WithSound(herdr.Sound(o.herdrSound))).Show
+	return l.client.Show
 }
+
+// reportFunc returns the reporter for this run, or nil when there is nowhere to
+// report to.
+//
+// A session with no pane can still show toasts, so the two are decided
+// separately: a toast is addressed to the session, a report to a pane.
+func (l *herdrLink) reportFunc() func(ctx context.Context, seq uint64, activity tui.Activity, unread int) error {
+	if l == nil || !l.client.CanReport() {
+		return nil
+	}
+
+	return func(ctx context.Context, seq uint64, activity tui.Activity, unread int) error {
+		l.inFlight.Add(1)
+		defer l.inFlight.Done()
+
+		// Reports run concurrently, so the highest number is taken rather than
+		// the latest one to arrive here.
+		for high := l.seq.Load(); seq > high; high = l.seq.Load() {
+			if l.seq.CompareAndSwap(high, seq) {
+				break
+			}
+		}
+
+		state, title := herdrStatus(activity, unread)
+		return l.client.Report(ctx, seq, state, title)
+	}
+}
+
+// release withdraws the report after the terminal loop has ended.
+//
+// It waits for reports already under way first, so the withdrawal is the last
+// thing the server hears from this run. The context is usually already done by
+// this point — ctrl+c is how most people leave octify — so the withdrawal is
+// sent on one that does not inherit that.
+func (l *herdrLink) release(ctx context.Context) {
+	if l == nil || !l.client.CanReport() {
+		return
+	}
+	l.inFlight.Wait()
+
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+
+	if err := l.client.Release(releaseCtx, l.seq.Add(1)); err != nil {
+		logging.From(ctx).Warn("could not withdraw the herdr report", slog.Any("error", err))
+	}
+}
+
+// herdrStatus translates what octify is doing into what herdr shows.
+//
+// Waiting for the device code is blocked rather than working because it is
+// exactly what herdr means by blocked: nothing moves until a person answers.
+// Unread notifications are blocked for the same reason at one remove — they are
+// the program asking for attention.
+func herdrStatus(activity tui.Activity, unread int) (herdr.State, string) {
+	switch activity {
+	case tui.ActivitySignedOut:
+		return herdr.StateIdle, "not signed in"
+	case tui.ActivityAuthenticating:
+		return herdr.StateBlocked, "waiting for the device code"
+	case tui.ActivityLoading:
+		return herdr.StateWorking, "loading"
+	case tui.ActivityReady:
+		title := strconv.Itoa(unread) + " unread"
+		if unread == 0 {
+			return herdr.StateIdle, title
+		}
+		return herdr.StateBlocked, title
+	default:
+		return herdr.StateUnknown, "octify"
+	}
+}
+
+// releaseTimeout bounds the withdrawal at the end of a run, which happens after
+// the screen is already gone.
+const releaseTimeout = 2 * time.Second
