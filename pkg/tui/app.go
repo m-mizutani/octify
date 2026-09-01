@@ -28,6 +28,11 @@ type Config struct {
 	OpenURL  func(ctx context.Context, url string) error
 	ShowRead bool
 	Now      func() time.Time
+	// Announce shows a desktop toast. It is nil whenever there is nowhere to
+	// show one, which is every run outside a herdr pane, and a nil value is the
+	// whole of how this program behaves without herdr: nothing downstream of
+	// here looks for one.
+	Announce func(ctx context.Context, title, body string) error
 }
 
 type phase int
@@ -95,6 +100,13 @@ type Model struct {
 	// pollGeneration identifies the current poll chain; anything from an older
 	// one is ignored.
 	pollGeneration int
+
+	// baselined records that a poll of this session has already put a list on
+	// screen, which is what the next poll is compared against. The first list of
+	// a session announces nothing: it would otherwise be measured against
+	// whatever a previous run saved, and a few days away turns the whole inbox
+	// into one toast.
+	baselined bool
 
 	archive *archiveState
 	status  model.UserMessage
@@ -347,6 +359,9 @@ func (m Model) handlePollResult(msg pollResultMsg) (tea.Model, tea.Cmd) {
 			m.phase = phaseUnauthenticated
 			m.all = nil
 			m.showingCache = false
+			// The list that was the basis for comparison is gone with it, so the
+			// first list after signing in again announces nothing.
+			m.baselined = false
 			m.selected = make(map[types.ThreadID]struct{})
 			m.status = messageOf(msg.err)
 			return m, nil
@@ -373,12 +388,88 @@ func (m Model) handlePollResult(msg pollResultMsg) (tea.Model, tea.Cmd) {
 		return m, m.scheduleNextPoll(interval)
 	}
 
+	var announce tea.Cmd
 	if !msg.res.NotModified {
+		// The comparison has to happen while m.all is still the previous list,
+		// and the read records are already reconciled by the cycle that produced
+		// this result, so the unread decision here is the one about to be drawn.
+		var arrivals []model.Notification
+		if m.cfg.Announce != nil && m.baselined {
+			arrivals = m.arrivals(msg.res.Notifications)
+		}
+		m.baselined = true
 		m.applyNotifications(msg.res)
+		announce = m.announceCmd(arrivals)
 	}
 	m.status = pollStatus(msg.res)
 
-	return m, m.scheduleNextPoll(interval)
+	// tea.Batch drops a nil command and returns a lone survivor as it is, so a
+	// cycle with nothing to announce schedules the next poll exactly as before.
+	return m, tea.Batch(announce, m.scheduleNextPoll(interval))
+}
+
+// arrivals is the announceable half of a poll: what Arrivals found, minus
+// anything the user has already read.
+//
+// Reading a thread locally does not silence its next comment: an update makes
+// the read record stale, which puts the thread back to unread.
+func (m Model) arrivals(next []model.Notification) []model.Notification {
+	found := model.Arrivals(m.all, next)
+
+	out := make([]model.Notification, 0, len(found))
+	for _, n := range found {
+		if m.uc.Unread(n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// announceCmd sends one toast for the whole batch, off the update loop. It
+// returns nil when there is nothing to send or nowhere to send it.
+//
+// A failure never reaches the screen. The toast is an aid; the list it points
+// at is fully usable without it, and a herdr with toasts switched off must not
+// overwrite the status line once a minute.
+func (m Model) announceCmd(arrivals []model.Notification) tea.Cmd {
+	if len(arrivals) == 0 || m.cfg.Announce == nil {
+		return nil
+	}
+
+	title, body := announceText(arrivals)
+	announce, ctx := m.cfg.Announce, m.ctx
+
+	return func() tea.Msg {
+		if err := announce(ctx, title, body); err != nil {
+			logging.From(ctx).Warn("could not show the herdr notification", slog.Any("error", err))
+		}
+		return nil
+	}
+}
+
+// announceText composes one toast for the whole batch. One poll can answer with
+// ten new notifications, and ten toasts would race the toast rate limit with no
+// way to tell which of them was dropped.
+func announceText(ns []model.Notification) (title, body string) {
+	if len(ns) == 0 {
+		return "", ""
+	}
+
+	first := ns[0]
+	if len(ns) == 1 {
+		title = "octify"
+		if first.Repo.FullName != "" {
+			title += " · " + string(first.Repo.FullName)
+		}
+		return title, first.Subject.Title
+	}
+
+	title = "octify · " + strconv.Itoa(len(ns)) + " new notifications"
+	body = first.Subject.Title
+	if first.Repo.FullName != "" {
+		body = string(first.Repo.FullName) + ": " + body
+	}
+	return title, body + " (+" + strconv.Itoa(len(ns)-1) + " more)"
 }
 
 func (m Model) scheduleNextPoll(d time.Duration) tea.Cmd {
@@ -454,6 +545,7 @@ func (m Model) handleArchiveEvent(msg archiveEventMsg) (tea.Model, tea.Cmd) {
 		m.archive.fatal = true
 		m.phase = phaseUnauthenticated
 		m.all = nil
+		m.baselined = false
 		m.selected = make(map[types.ThreadID]struct{})
 		m.status = messageOf(msg.ev.Err)
 		return m, waitArchive(msg.ch)

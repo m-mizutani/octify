@@ -28,6 +28,26 @@ func ConfigForTest(ctx context.Context, argv []string) (usecase.Config, error) {
 	return got, nil
 }
 
+// AnnounceForTest reports whether the given argv, in the environment the test
+// has set up, leaves the TUI somewhere to send desktop notifications.
+func AnnounceForTest(ctx context.Context, argv []string) (bool, error) {
+	var opt options
+	var got bool
+
+	cmd := &ucli.Command{
+		Name:  "octify",
+		Flags: opt.flags(),
+		Action: func(context.Context, *ucli.Command) error {
+			got = opt.announceFunc() != nil
+			return nil
+		},
+	}
+	if err := cmd.Run(ctx, argv); err != nil {
+		return false, err
+	}
+	return got, nil
+}
+
 // Paths reports where the three files land for the given argv, which is the
 // other half of what the flags decide.
 type Paths struct {
